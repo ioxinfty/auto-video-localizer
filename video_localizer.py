@@ -409,7 +409,7 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
     base_url = config.ollama_base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     client = ollama.Client(host=base_url)
 
-    BATCH_SIZE = 5  # 每批翻译条数，减少以提高准确性
+    BATCH_SIZE = 10  # 每批翻译条数
     MAX_RETRIES = 2  # 最大重试次数
 
     # 使用 temp_dir 或默认 output/debug_translations
@@ -558,7 +558,7 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
         raise ValueError("请设置 DashScope API Key")
 
     dashscope.api_key = config.dashscope_key
-    BATCH_SIZE = 5  # 每批翻译条数，减少以提高准确性
+    BATCH_SIZE = 10  # 每批翻译条数
     MAX_RETRIES = 2  # 最大重试次数
 
     # 使用 temp_dir 或默认 output
@@ -1282,9 +1282,13 @@ def main(
 # 批量处理队列
 # ============================================================
 
-def get_ms_agent_batch_queue() -> list[dict]:
+def get_ms_agent_batch_queue(output_dir: str, skip_completed: bool = True) -> list[dict]:
     """
     获取微软 Agent Framework 课程的批量处理队列。
+    
+    Args:
+        output_dir: 输出目录
+        skip_completed: 是否跳过已完成的视频（通过检查 .cn.mp4 是否存在判断）
     返回格式: [{"seq": 序号, "video": 视频路径, "srt": 字幕路径}, ...]
     """
     import re
@@ -1310,10 +1314,26 @@ def get_ms_agent_batch_queue() -> list[dict]:
             num = int(m.group(1))
             srt_files[num] = str(srt_path)
 
-    # 3. 按序号配对 (1 -> 52)
+    # 3. 收集已完成的视频序号
+    completed_seqs = set()
+    if skip_completed:
+        for out_path in Path(output_dir).iterdir():
+            if out_path.is_dir():
+                mp4_file = out_path / f"{out_path.name}.cn.mp4"
+                if mp4_file.exists() and mp4_file.stat().st_size > 1000:
+                    # 从目录名提取序号，如 "[P1]1. Welcome" -> 1
+                    m = re.match(r'\[P\d*\]?(\d+)', out_path.name)
+                    if m:
+                        completed_seqs.add(int(m.group(1)))
+
+    # 4. 按序号配对 (1 -> 52)，跳过已完成的
     task_list = []
+    skipped = 0
     for num in range(1, 53):
         if num in video_files and num in srt_files:
+            if skip_completed and num in completed_seqs:
+                skipped += 1
+                continue
             task_list.append({
                 "seq": num,
                 "video": video_files[num],
@@ -1322,6 +1342,9 @@ def get_ms_agent_batch_queue() -> list[dict]:
         else:
             print(f"⚠️ 序号 {num} 配对缺失: video={num in video_files}, srt={num in srt_files}")
 
+    if skipped > 0:
+        print(f"⏭️ 跳过 {skipped} 个已完成视频")
+
     return task_list
 
 
@@ -1329,7 +1352,7 @@ def run_batch_process(config: Config, output_dir: str):
     """
     批量处理队列中的所有视频。
     """
-    task_list = get_ms_agent_batch_queue()
+    task_list = get_ms_agent_batch_queue(output_dir)
     print(f"📋 共配对 {len(task_list)}/52 个任务")
     for t in task_list[:3]:
         print(f"   [{t['seq']}] {Path(t['video']).name} ↔ {Path(t['srt']).name}")
@@ -1340,12 +1363,20 @@ def run_batch_process(config: Config, output_dir: str):
         seq = task["seq"]
         video_path = task["video"]
         srt_path = task["srt"]
+        video_name = Path(video_path).stem  # 如 "[P1]1. Welcome"
 
         print(f"\n{'='*70}")
         print(f"🎬 进度: [{idx + 1}/{len(task_list)}] 序号 {seq}")
         print(f"📹 视频: {Path(video_path).name}")
         print(f"📄 字幕: {Path(srt_path).name}")
         print(f"{'='*70}")
+
+        # 如果 resume_from_checkpoint=True，检查是否已有输出
+        if config.resume_from_checkpoint:
+            final_video = Path(output_dir) / video_name / f"{video_name}.cn.mp4"
+            if final_video.exists() and final_video.stat().st_size > 1000:
+                print(f"  ⏭️ 已存在输出文件，跳过: {final_video.name}")
+                continue
 
         try:
             main(
@@ -1370,18 +1401,18 @@ def run_batch_process(config: Config, output_dir: str):
 if __name__ == "__main__":
     # 配置
     config = Config(
-        use_local_llm=True,
-        ollama_base_url="http://192.168.0.80:11434",
-        ollama_model="qwen2.5:14b",
-        tts_voice="zh-CN-YunxiNeural",
-        tts_delay=0.2,
-        keep_original_bgm=False,
-        bgm_volume=0.25,
-        keep_original_voice=False,
-        burn_subtitles=False,
-        enable_checkpoint=True,
-        resume_from_checkpoint=True,   # 断点续传
-        speed_ratio_max=1.0,           # 不降速（最多保持原速）
+        use_local_llm=True,            # 翻译方式：True=本地 Ollama，False=云端 DashScope
+        ollama_base_url="http://192.168.0.80:11434",  # Ollama 服务器地址
+        ollama_model="qwen2.5:14b",     # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
+        tts_voice="zh-CN-YunxiNeural",  # TTS 语音：YunxiNeural(云希男声，推荐), YunyangNeural(云扬), XiaoxiaoNeural(晓晓女声)
+        tts_delay=0.2,                  # TTS 请求延时（秒），避免被限速
+        keep_original_bgm=False,       # 是否保留原视频背景音乐
+        bgm_volume=0.25,               # BGM 音量（0.0-1.0）
+        keep_original_voice=False,     # 是否保留原视频人声：False=完全移除，True=保留原音
+        burn_subtitles=False,          # 是否烧录字幕到视频：False=外挂字幕，True=烧录到视频
+        enable_checkpoint=True,        # 是否启用断点续传
+        resume_from_checkpoint=True,   # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
+        speed_ratio_max=1.0,          # 语速上限：1.0=不降速（最多保持原速），1.05=最多减速5%
     )
 
     output_dir = "/Users/iox/Desktop/msagent/output"
