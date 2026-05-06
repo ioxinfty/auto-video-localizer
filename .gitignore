@@ -14,11 +14,8 @@ source/
 # 临时文件（包含所有中间处理文件）
 temp/
 
-# 输出目录 - 只忽略临时文件，保留最终结果
-output/**/*.wav
-output/**/*.mp3
-output/**/processing_data.json
-output/**/debug_translations/
+# 输出目录
+output/
 
 # macOS
 .DS_Store
