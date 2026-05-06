@@ -1278,33 +1278,113 @@ def main(
 # 入口
 # ============================================================
 
+# ============================================================
+# 批量处理队列
+# ============================================================
+
+def get_ms_agent_batch_queue() -> list[dict]:
+    """
+    获取微软 Agent Framework 课程的批量处理队列。
+    返回格式: [{"seq": 序号, "video": 视频路径, "srt": 字幕路径}, ...]
+    """
+    import re
+    from pathlib import Path
+
+    source_dir = '/Users/iox/Desktop/msagent/source'
+    video_base = f'{source_dir}/[中文字幕]使用微软 Agent Framework 框架进行 C# Ai 开发'
+    srt_base = f'{source_dir}/AI in C# using the Microsoft Agent Framework 2026.1'
+
+    # 1. 收集所有视频文件并提取序号
+    video_files = {}
+    for f in Path(video_base).glob("*.mp4"):
+        m = re.match(r'\[P\d*\]?(\d+)\.\s*(.+)\.mp4$', f.name)
+        if m:
+            num = int(m.group(1))
+            video_files[num] = str(f)
+
+    # 2. 收集所有字幕文件并提取序号
+    srt_files = {}
+    for srt_path in Path(srt_base).rglob("*.en_US.srt"):
+        m = re.match(r'(\d+)\.\s*(.+)\.en_US\.srt$', srt_path.name)
+        if m:
+            num = int(m.group(1))
+            srt_files[num] = str(srt_path)
+
+    # 3. 按序号配对 (1 -> 52)
+    task_list = []
+    for num in range(1, 53):
+        if num in video_files and num in srt_files:
+            task_list.append({
+                "seq": num,
+                "video": video_files[num],
+                "srt": srt_files[num],
+            })
+        else:
+            print(f"⚠️ 序号 {num} 配对缺失: video={num in video_files}, srt={num in srt_files}")
+
+    return task_list
+
+
+def run_batch_process(config: Config, output_dir: str):
+    """
+    批量处理队列中的所有视频。
+    """
+    task_list = get_ms_agent_batch_queue()
+    print(f"📋 共配对 {len(task_list)}/52 个任务")
+    for t in task_list[:3]:
+        print(f"   [{t['seq']}] {Path(t['video']).name} ↔ {Path(t['srt']).name}")
+    if len(task_list) > 3:
+        print(f"   ...")
+
+    for idx, task in enumerate(task_list):
+        seq = task["seq"]
+        video_path = task["video"]
+        srt_path = task["srt"]
+
+        print(f"\n{'='*70}")
+        print(f"🎬 进度: [{idx + 1}/{len(task_list)}] 序号 {seq}")
+        print(f"📹 视频: {Path(video_path).name}")
+        print(f"📄 字幕: {Path(srt_path).name}")
+        print(f"{'='*70}")
+
+        try:
+            main(
+                video_path=video_path,
+                srt_path=srt_path,
+                output_dir=output_dir,
+                config=config,
+            )
+        except Exception as e:
+            print(f"❌ [{seq}] 处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    print(f"\n🎉 全部完成! 共处理 {len(task_list)} 个视频")
+
+
+# ============================================================
+# 入口
+# ============================================================
+
 if __name__ == "__main__":
-    # 示例配置
+    # 配置
     config = Config(
-        use_local_llm=True,             # 翻译方式：True=本地 Ollama，False=云端 DashScope
-        ollama_base_url="http://192.168.0.80:11434",  # Ollama 远程服务器地址
-        ollama_model="qwen2.5:14b",      # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
-        tts_voice="zh-CN-YunxiNeural",   # TTS 语音：YunxiNeural(云希男声), YunyangNeural(云扬男声), XiaoxiaoNeural(晓晓女声)
-        tts_delay=0.2,                    # TTS 请求延时（秒），避免被限速
-        keep_original_bgm=False,          # 是否保留原视频背景音乐
-        bgm_volume=0.25,                  # BGM 音量（0.0-1.0）
-        keep_original_voice=False,        # 是否保留原视频人声：False=完全移除，True=保留原音
-        burn_subtitles=False,             # 是否烧录字幕到视频：False=外挂字幕，True=烧录到视频
-        enable_checkpoint=True,           # 是否启用断点续传
-        resume_from_checkpoint=False,     # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
+        use_local_llm=True,
+        ollama_base_url="http://192.168.0.80:11434",
+        ollama_model="qwen2.5:14b",
+        tts_voice="zh-CN-YunxiNeural",
+        tts_delay=0.2,
+        keep_original_bgm=False,
+        bgm_volume=0.25,
+        keep_original_voice=False,
+        burn_subtitles=False,
+        enable_checkpoint=True,
+        resume_from_checkpoint=True,   # 断点续传
+        speed_ratio_max=1.0,           # 不降速（最多保持原速）
     )
 
-    # # 视频和字幕路径（放在 source 目录中）
-    # source_dir = '/Users/iox/Desktop/msagent/source'
-    # video_path = f'{source_dir}/[中文字幕]使用微软 Agent Framework 框架进行 C# Ai 开发/[P1]1. Welcome.mp4'
-    # srt_path = f'{source_dir}/AI in C# using the Microsoft Agent Framework 2026.1/1 - Introduction to the course/1. Welcome.en_US.srt'
-    # output_dir = "/Users/iox/Desktop/msagent/output"
+    output_dir = "/Users/iox/Desktop/msagent/output"
 
-    # main(
-    #     video_path=video_path,
-    #     srt_path=srt_path,
-    #     output_dir=output_dir,
-    #     config=config
-    # )
-
-    
+    # 批量处理
+    run_batch_process(config, output_dir)
