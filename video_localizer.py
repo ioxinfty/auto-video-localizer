@@ -248,15 +248,15 @@ def _is_sentence_ending(text: str) -> bool:
 # 第三步：翻译（Ollama 本地 或 DashScope 云端）
 # ============================================================
 
-def translate_sentences(sentences: list[dict], config: Config) -> list[dict]:
+def translate_sentences(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
     """翻译完整句子"""
     if config.use_local_llm:
-        return _translate_with_ollama(sentences, config)
+        return _translate_with_ollama(sentences, config, temp_dir)
     else:
-        return _translate_with_dashscope(sentences, config)
+        return _translate_with_dashscope(sentences, config, temp_dir)
 
 
-def _translate_with_ollama(sentences: list[dict], config: Config) -> list[dict]:
+def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
     """使用本地 Ollama + Qwen 翻译（支持远程地址）"""
     try:
         import ollama
@@ -268,8 +268,9 @@ def _translate_with_ollama(sentences: list[dict], config: Config) -> list[dict]:
     client = ollama.Client(host=base_url)
 
     BATCH_SIZE = 10
-    output_dir = Path(getattr(config, 'output_dir', 'output'))
-    debug_dir = output_dir / "debug_translations"
+    # 使用 temp_dir 或默认 output/debug_translations
+    work_dir = Path(temp_dir) if temp_dir else Path('output')
+    debug_dir = work_dir / "debug_translations"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(0, len(sentences), BATCH_SIZE):
@@ -337,7 +338,7 @@ def _translate_with_ollama(sentences: list[dict], config: Config) -> list[dict]:
     return sentences
 
 
-def _translate_with_dashscope(sentences: list[dict], config: Config) -> list[dict]:
+def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
     """使用阿里云 DashScope Qwen API 翻译"""
     try:
         import dashscope
@@ -350,8 +351,9 @@ def _translate_with_dashscope(sentences: list[dict], config: Config) -> list[dic
 
     dashscope.api_key = config.dashscope_key
     BATCH_SIZE = 10
-    output_dir = Path(getattr(config, 'output_dir', 'output'))
-    debug_dir = output_dir / "debug_translations"
+    # 使用 temp_dir 或默认 output
+    work_dir = Path(temp_dir) if temp_dir else Path('output')
+    debug_dir = work_dir / "debug_translations"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(0, len(sentences), BATCH_SIZE):
@@ -646,7 +648,8 @@ def process_video(
     output_path: str,
     config: Config,
     chinese_srt_path: str = None,
-    english_srt_path: str = None
+    english_srt_path: str = None,
+    temp_dir: str = None
 ):
     """
     使用 FFmpeg 合并视频和中文音频
@@ -661,7 +664,7 @@ def process_video(
     chinese_audio_path = Path(chinese_audio_path)
     output_path = Path(output_path)
 
-    temp_dir = Path(config.temp_dir)
+    temp_dir = Path(temp_dir) if temp_dir else Path(config.temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     original_audio_path = temp_dir / "original_audio.wav"
@@ -763,6 +766,17 @@ def main(
     """
     完整流水线：
     SRT → 拼接整句 → 翻译 → TTS → 音频拼接 → 视频合并
+
+    目录结构：
+    - output/              # 最终输出（视频、字幕）
+      └── {video_name}/    # 按视频名分目录
+          ├── *.cn.mp4     # 中文配音视频
+          ├── *.chs.srt    # 中文字幕
+          └── *.en.srt     # 英文字幕
+    - temp/                 # 临时文件（按视频名分目录）
+      └── {video_name}/
+          ├── audio/       # TTS 生成的音频片段
+          └── *.wav        # 中间音频文件
     """
     if config is None:
         config = Config()
@@ -770,18 +784,31 @@ def main(
     video_path = Path(video_path)
     srt_path = Path(srt_path)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = output_dir / config.temp_dir
+    # 根据视频文件名创建子目录，避免多视频冲突
+    video_name = video_path.stem  # 不含扩展名的视频名
+    work_dir = video_name  # 用于 temp 目录的子目录名
+
+    # 临时文件目录（按视频分）
+    temp_base = Path(config.temp_dir)
+    temp_dir = temp_base / work_dir
     audio_dir = temp_dir / "audio"
+
+    # 创建目录
+    temp_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
+
+    # 最终输出目录
+    final_output_dir = output_dir / video_name
+    final_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("📺 英文视频中文配音流水线")
     print("=" * 60)
     print(f"  视频: {video_path}")
     print(f"  字幕: {srt_path}")
-    print(f"  输出: {output_dir}")
+    print(f"  临时目录: {temp_dir}")
+    print(f"  输出目录: {final_output_dir}")
     print("=" * 60)
 
     # Step 1: 读取 SRT
@@ -803,12 +830,7 @@ def main(
         print(f"  使用 Ollama ({config.ollama_model}) @ {base_url}")
     else:
         print("  使用阿里云 DashScope API")
-    sentences = translate_sentences(sentences, config)
-
-    # 保存翻译结果
-    trans_srt = output_dir / "translations.srt"
-    save_srt(sentences, str(trans_srt))
-    print(f"  翻译结果已保存: {trans_srt}")
+    sentences = translate_sentences(sentences, config, str(temp_dir))
 
     # Step 4: 计算 TTS 语速
     print("\n⚡ Step 4: 计算 TTS 语速参数...")
@@ -833,7 +855,7 @@ def main(
 
     # Step 6: 拼接音频
     print("\n📦 Step 6: 拼接音频片段...")
-    chinese_audio = output_dir / "chinese_audio.wav"
+    chinese_audio = temp_dir / "chinese_audio.wav"
     stitch_audio_segments(sentences, config, str(chinese_audio))
 
     # Step 7: 合并视频
@@ -868,18 +890,20 @@ def main(
         if english_segments:
             save_srt(english_segments, str(english_srt_path))
 
-        final_video = output_dir / video_path.with_suffix(".cn.mp4").name
+        # 最终视频输出到 output/{video_name}/
+        final_video = final_output_dir / f"{video_name}.cn.mp4"
         process_video(
             str(video_path), str(chinese_audio), str(final_video), config,
             chinese_srt_path=str(chinese_srt_path) if chinese_segments else None,
-            english_srt_path=str(english_srt_path) if english_segments else None
+            english_srt_path=str(english_srt_path) if english_segments else None,
+            temp_dir=str(temp_dir)
         )
     else:
         print("\n⚠️ 视频文件不存在，跳过视频合并步骤")
         print(f"  中文音频已生成: {chinese_audio}")
 
-    # 保存完整数据
-    data_path = output_dir / "processing_data.json"
+    # 保存完整数据到 temp 目录
+    data_path = temp_dir / "processing_data.json"
     with open(data_path, "w", encoding="utf-8") as f:
         # 转换 Path 对象为字符串
         serializable = []
