@@ -102,11 +102,12 @@ class Config:
     tts_voice: str = "zh-CN-YunxiNeural"  # 默认男声
 
     # 中文朗读速率（字/秒），用于估算时长
-    chinese_reading_speed: float = 4.5  # 正常语速
+    # 正常语速约 5-6 字/秒，略微放慢便于学习
+    chinese_reading_speed: float = 5.2
 
     # 语速比例限制（防止失真）
-    speed_ratio_min: float = 0.6  # 最小语速（原速的60%）
-    speed_ratio_max: float = 1.4  # 最大语速（原速的140%）
+    speed_ratio_min: float = 0.77  # 最小语速（最多加速30%，1/1.3）
+    speed_ratio_max: float = 1.05  # 最大语速（最多减速5%，1/0.95）
 
     # Edge-TTS 延时（秒），避免请求过快被限
     tts_delay: float = 0.2
@@ -115,8 +116,11 @@ class Config:
     audio_format: str = "wav"  # wav 或 mp3
 
     # BGM 配置
-    keep_original_bgm: bool = True  # 是否保留原视频背景音乐
+    keep_original_bgm: bool = False  # 是否保留原视频背景音乐
     bgm_volume: float = 0.25  # BGM 音量（0.0-1.0）
+
+    # 原语音处理
+    keep_original_voice: bool = False  # 是否保留原视频人声（False=完全移除，只用中文配音）
 
     # 字幕烧录配置
     burn_subtitles: bool = False  # 是否烧录字幕到视频（False=使用外挂字幕）
@@ -233,6 +237,7 @@ def merge_segments_to_sentences(segments: list[dict]) -> list[dict]:
     1. 段尾是否有句末标点（. ! ? 。！？ " ' ）
     2. 或段尾是否为常见缩写（如 Dr. Mr. e.g.）
     3. 连续多段但中间有明显停顿（>1秒），也视为分隔
+    4. 优先检查是否为未完成的短语（如介词 to/for/of 结尾）
     """
     sentences = []
     current = None
@@ -254,10 +259,16 @@ def merge_segments_to_sentences(segments: list[dict]) -> list[dict]:
         # 判断是否句末
         text = seg["text"].strip()
 
+        # 优先检查是否为未完成的短语（应该继续合并）
+        if _is_incomplete_phrase(text):
+            # 未完成短语，不断开
+            last_end = seg["end"]
+            continue
+
         # 检查是否有句末标点
         is_sentence_end = _is_sentence_ending(text)
 
-        # 检查是否有明显停顿（超过 1 秒视为分隔）
+        # 检查是否有明显停顿（超过 1.5 秒视为分隔）
         pause_duration = seg["start"] - last_end
         if pause_duration > 1.5 and len(current["text"].split()) > 5:
             is_sentence_end = True
@@ -275,6 +286,75 @@ def merge_segments_to_sentences(segments: list[dict]) -> list[dict]:
         sentences.append(current)
 
     return sentences
+
+
+def _is_incomplete_phrase(text: str) -> bool:
+    """
+    判断文本是否为未完成的短语（应该继续合并，不应断句）
+
+    例如：
+    - "access a large" (to 不完整)
+    - "cost you a bit" (of 不完整)
+    - "demoing primarily" (Azure 不完整)
+    """
+    text = text.strip().lower()
+
+    if not text:
+        return False
+
+    # 检查是否以常见介词/连词结尾（表示句子未完成）
+    incomplete_endings = (
+        # 介词
+        "to", "for", "of", "in", "on", "at", "by", "with", "from", "about",
+        "into", "through", "during", "before", "after", "above", "below",
+        "between", "under", "again", "further", "then", "once",
+        # 不定式 to 后面的动词被打断
+        "going to", "need to", "want to", "have to", "able to",
+        # 冠词后的名词可能不完整
+        "a", "an", "the",
+        # 形容词后可能跟名词
+        "large", "small", "big", "new", "old", "first", "last",
+        # 其他常见未完成模式
+        "primarily", "mainly", "mostly", "partially",
+    )
+
+    # 获取最后一个单词
+    words = text.split()
+    if not words:
+        return False
+
+    last_word = words[-1].rstrip(".,!?;:'\"")
+    last_two = " ".join(words[-2:]) if len(words) >= 2 else last_word
+
+    if last_word in incomplete_endings or last_two in incomplete_endings:
+        return True
+
+    # 检查是否以常见句法模式结尾
+    # "... access a" 后面很可能跟名词
+    if text.endswith(" access ") or text.endswith(" access a"):
+        return True
+
+    # "... need " 后面可能跟动词
+    if text.endswith(" need "):
+        return True
+
+    # "... going to" 后面可能跟动词
+    if text.endswith(" going to"):
+        return True
+
+    # "... large" 后面可能跟名词（如 language model）
+    if text.endswith(" large") or text.endswith(" big") or text.endswith(" small"):
+        return True
+
+    # "... primarily" 后面可能跟名词（如 Azure OpenAI）
+    if text.endswith(" primarily") or text.endswith(" mainly") or text.endswith(" mostly"):
+        return True
+
+    # "... bit" 后面可能跟 "of"
+    if text.endswith(" bit"):
+        return True
+
+    return False
 
 
 def _is_sentence_ending(text: str) -> bool:
@@ -329,10 +409,16 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
     base_url = config.ollama_base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     client = ollama.Client(host=base_url)
 
-    BATCH_SIZE = 10
+    BATCH_SIZE = 5  # 每批翻译条数，减少以提高准确性
+    MAX_RETRIES = 2  # 最大重试次数
+
     # 使用 temp_dir 或默认 output/debug_translations
     work_dir = Path(temp_dir) if temp_dir else Path('output')
     debug_dir = work_dir / "debug_translations"
+
+    # 每次运行清空调试目录
+    if debug_dir.exists():
+        shutil.rmtree(debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(0, len(sentences), BATCH_SIZE):
@@ -346,7 +432,7 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
         prompt = f"""你是一个专业的英文教学视频字幕翻译专家。请将以下英文字幕翻译为中文，要求：
 
 1. 保持教学语气，自然、清晰、易懂
-2. 保留专业术语不翻译（如 Agent, LLM, API, SDK, GitHub, NuGet 等）
+2. 保留专业术语不翻译（如 Agent, LLM, API, SDK, GitHub, NuGet, C# 等）
 3. 适当增补语气词，使中文听起来更自然（如"好"、"那么"、"我们来看"）
 4. 按序号逐条返回，格式：序号. 中文翻译
 5. 不要添加多余解释
@@ -355,19 +441,34 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
 {batch_texts}
 {'-' * 40}
 返回示例：
-1. 让我们开始使用 Agent 框架
+1. 让我们开始使用 C# Agent 框架
 2. 现在我们已经建立了原始连接
 """
 
-        try:
-            print(f"  📤 发送翻译请求到 {base_url} (批次 {batch_idx})...")
-            response = client.chat(
-                model=config.ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.3}  # 降低随机性，保持翻译一致
-            )
+        raw_response = None
+        last_error = None
 
-            raw_response = response['message']['content']
+        for retry in range(MAX_RETRIES):
+            try:
+                retry_msg = f" (重试 {retry + 1}/{MAX_RETRIES})" if retry > 0 else ""
+                print(f"  📤 发送翻译请求到 {base_url} (批次 {batch_idx}){retry_msg}...")
+                response = client.chat(
+                    model=config.ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.3}  # 降低随机性，保持翻译一致
+                )
+
+                raw_response = response['message']['content']
+                break  # 成功则退出重试循环
+
+            except Exception as e:
+                last_error = e
+                if retry < MAX_RETRIES - 1:
+                    print(f"  ⚠️ 翻译请求失败: {e}，准备重试...")
+                else:
+                    print(f"  ❌ 翻译请求失败: {e}")
+
+        if raw_response:
             # 保存原始响应用于调试
             debug_file = debug_dir / f"batch_{batch_idx:03d}_raw.txt"
             debug_file.write_text(raw_response, encoding='utf-8')
@@ -378,26 +479,71 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
             success_count = sum(1 for t in translations if t and "（翻译失败）" not in t)
             print(f"  📥 批次 {batch_idx} 解析完成: {success_count}/{len(batch)} 条成功")
 
-            if len(translations) != len(batch):
-                print(f"  ⚠️ 警告: 解析数量不匹配! 期望 {len(batch)}, 实际 {len(translations)}")
-
+            # 先记录翻译结果
             for j, t in enumerate(translations):
-                sentences[i + j]["cn_text"] = t.strip()
-                if "（翻译失败）" in t:
-                    print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}]: 解析失败 - {batch[j]['text'][:30]}...")
+                if j < len(batch):
+                    sentences[i + j]["cn_text"] = t.strip()
+
+            # 单独重试失败的翻译
+            failed_indices = []
+            for j, t in enumerate(translations):
+                if j < len(batch) and "（翻译失败）" in t:
+                    failed_indices.append(j)
+                    print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}] 失败: \"{batch[j]['text']}\"")
+
+            # 批量重试失败的翻译
+            for j in failed_indices:
+                retry_translation = _retry_single_translation(client, batch[j]['text'], config)
+                if retry_translation:
+                    sentences[i + j]["cn_text"] = retry_translation
+                    print(f"  🔄 重试成功 [{i + j + 1}]")
+                    print(f"     EN: {batch[j]['text']}")
+                    print(f"     CN: {retry_translation}")
                 else:
-                    print(f"  ✅ 翻译 [{i + j + 1}/{len(sentences)}]: {t[:40]}...")
+                    print(f"  ❌ 重试失败 [{i + j + 1}]: \"{batch[j]['text']}\"")
+
+            # 打印所有翻译结果
+            for j in range(len(batch)):
+                t = sentences[i + j].get("cn_text", "")
+                status = "⚠️" if ("（翻译失败）" in t or "[翻译失败]" in t) else "✅"
+                print(f"  {status} [{i + j + 1}/{len(sentences)}]")
+                print(f"     EN: {batch[j]['text']}")
+                print(f"     CN: {t}")
 
             # 保存解析后的结果
             parsed_file = debug_dir / f"batch_{batch_idx:03d}_parsed.txt"
-            parsed_file.write_text("\n".join([f"{j+1}. {t}" for j, t in enumerate(translations)]), encoding='utf-8')
-
-        except Exception as e:
-            print(f"  ⚠️ 翻译批次 {batch_idx} 失败: {e}")
+            parsed_file.write_text("\n".join([f"{j+1}. {sentences[i + j].get('cn_text', '')}" for j in range(len(batch))]), encoding='utf-8')
+        else:
+            print(f"  ❌ 批次 {batch_idx} 翻译失败: {last_error}")
             for j in range(len(batch)):
                 sentences[i + j]["cn_text"] = f"[翻译失败] {batch[j]['text']}"
 
     return sentences
+
+
+def _retry_single_translation(client, text: str, config: Config) -> str:
+    """单独重试翻译单条文本"""
+    try:
+        prompt = f"""翻译以下英文为中文教学语气，保留专业术语：
+
+原文: {text}
+
+只需返回翻译结果，不要其他解释："""
+
+        response = client.chat(
+            model=config.ollama_model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.3}
+        )
+
+        result = response['message']['content'].strip()
+        # 清理可能的引号
+        result = re.sub(r'^["""\'""\']+|["""\'""\']+$', '', result)
+        return result
+
+    except Exception as e:
+        print(f"    重试失败: {e}")
+        return None
 
 
 def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
@@ -412,10 +558,16 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
         raise ValueError("请设置 DashScope API Key")
 
     dashscope.api_key = config.dashscope_key
-    BATCH_SIZE = 10
+    BATCH_SIZE = 5  # 每批翻译条数，减少以提高准确性
+    MAX_RETRIES = 2  # 最大重试次数
+
     # 使用 temp_dir 或默认 output
     work_dir = Path(temp_dir) if temp_dir else Path('output')
     debug_dir = work_dir / "debug_translations"
+
+    # 每次运行清空调试目录
+    if debug_dir.exists():
+        shutil.rmtree(debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(0, len(sentences), BATCH_SIZE):
@@ -425,14 +577,29 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
 
         prompt = f"翻译为教学语气中文，保留专业术语：\n{batch_texts}"
 
-        try:
-            print(f"  📤 发送翻译请求到 DashScope (批次 {batch_idx})...")
-            response = Generation.call(
-                model="qwen-turbo",
-                prompt=prompt
-            )
+        raw_response = None
+        last_error = None
 
-            raw_response = response.output.text
+        for retry in range(MAX_RETRIES):
+            try:
+                retry_msg = f" (重试 {retry + 1}/{MAX_RETRIES})" if retry > 0 else ""
+                print(f"  📤 发送翻译请求到 DashScope (批次 {batch_idx}){retry_msg}...")
+                response = Generation.call(
+                    model="qwen-turbo",
+                    prompt=prompt
+                )
+
+                raw_response = response.output.text
+                break  # 成功则退出重试循环
+
+            except Exception as e:
+                last_error = e
+                if retry < MAX_RETRIES - 1:
+                    print(f"  ⚠️ 翻译请求失败: {e}，准备重试...")
+                else:
+                    print(f"  ❌ 翻译请求失败: {e}")
+
+        if raw_response:
             # 保存原始响应用于调试
             debug_file = debug_dir / f"batch_{batch_idx:03d}_raw.txt"
             debug_file.write_text(raw_response, encoding='utf-8')
@@ -443,21 +610,69 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
             success_count = sum(1 for t in translations if t and "（翻译失败）" not in t)
             print(f"  📥 批次 {batch_idx} 解析完成: {success_count}/{len(batch)} 条成功")
 
+            # 先记录翻译结果
             for j, t in enumerate(translations):
-                sentences[i + j]["cn_text"] = t.strip()
-                if "（翻译失败）" in t:
-                    print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}]: 解析失败 - {batch[j]['text'][:30]}...")
+                if j < len(batch):
+                    sentences[i + j]["cn_text"] = t.strip()
+
+            # 单独重试失败的翻译
+            failed_indices = []
+            for j, t in enumerate(translations):
+                if j < len(batch) and "（翻译失败）" in t:
+                    failed_indices.append(j)
+                    print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}] 失败: \"{batch[j]['text']}\"")
+
+            # 批量重试失败的翻译
+            for j in failed_indices:
+                retry_translation = _retry_single_translation_dashscope(batch[j]['text'], config)
+                if retry_translation:
+                    sentences[i + j]["cn_text"] = retry_translation
+                    print(f"  🔄 重试成功 [{i + j + 1}]")
+                    print(f"     EN: {batch[j]['text']}")
+                    print(f"     CN: {retry_translation}")
                 else:
-                    print(f"  ✅ 翻译 [{i + j + 1}/{len(sentences)}]: {t[:40]}...")
+                    print(f"  ❌ 重试失败 [{i + j + 1}]: \"{batch[j]['text']}\"")
+
+            # 打印所有翻译结果
+            for j in range(len(batch)):
+                t = sentences[i + j].get("cn_text", "")
+                status = "⚠️" if ("（翻译失败）" in t or "[翻译失败]" in t) else "✅"
+                print(f"  {status} [{i + j + 1}/{len(sentences)}]")
+                print(f"     EN: {batch[j]['text']}")
+                print(f"     CN: {t}")
 
             # 保存解析后的结果
             parsed_file = debug_dir / f"batch_{batch_idx:03d}_parsed.txt"
-            parsed_file.write_text("\n".join([f"{j+1}. {t}" for j, t in enumerate(translations)]), encoding='utf-8')
-
-        except Exception as e:
-            print(f"  ⚠️ 翻译批次 {batch_idx} 失败: {e}")
+            parsed_file.write_text("\n".join([f"{j+1}. {sentences[i + j].get('cn_text', '')}" for j in range(len(batch))]), encoding='utf-8')
+        else:
+            print(f"  ❌ 批次 {batch_idx} 翻译失败: {last_error}")
             for j in range(len(batch)):
                 sentences[i + j]["cn_text"] = f"[翻译失败] {batch[j]['text']}"
+
+    return sentences
+
+
+def _retry_single_translation_dashscope(text: str, config: Config) -> str:
+    """单独重试翻译单条文本（DashScope 版本）"""
+    try:
+        import dashscope
+        from dashscope import Generation
+
+        prompt = f"翻译为教学语气中文，保留专业术语：\n{text}"
+
+        response = Generation.call(
+            model="qwen-turbo",
+            prompt=prompt
+        )
+
+        result = response.output.text.strip()
+        # 清理可能的引号
+        result = re.sub(r'^["""\'""\']+|["""\'""\']+$', '', result)
+        return result
+
+    except Exception as e:
+        print(f"    重试失败: {e}")
+        return None
 
     return sentences
 
@@ -480,38 +695,11 @@ def _parse_translations(raw: str, expected_count: int) -> list[str]:
             translation = m.group(2).strip()
             matched_lines.append((m.group(1), translation))
             results.append(translation)
-            print(f"    方法1匹配 [{m.group(1)}]: {translation[:50]}...")
+            print(f"    匹配 [{m.group(1)}]: {translation[:50]}...")
 
-    print(f"  📊 方法1匹配: {len(matched_lines)}/{expected_count} 条")
+    print(f"  📊 解析结果: {len(matched_lines)}/{expected_count} 条")
 
-    # 方法2: 如果方法1匹配不足，尝试提取所有非空行
-    if len(results) < expected_count:
-        print(f"  📊 尝试方法2补充...")
-        lines = []
-        for line in raw.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            # 跳过纯数字行、markdown标记行
-            if re.match(r"^[\d\s]+$", line):
-                continue
-            if line.startswith("```") or line.startswith("【") or line.startswith("["):
-                continue
-            # 移除可能的引号包裹
-            line = re.sub(r'^["""\'""\']+|["""\'""\']+$', '', line)
-            if line:
-                lines.append(line)
-                print(f"    方法2补充: {line[:50]}...")
-
-        # 补充缺失的结果
-        added = 0
-        for line in lines[:expected_count]:
-            if line not in results:
-                results.append(line)
-                added += 1
-        print(f"  📊 方法2补充: {added} 条")
-
-    # 确保数量正确
+    # 确保数量正确，不足时标记失败
     while len(results) < expected_count:
         results.append("（翻译失败）")
         print(f"  ⚠️ 补充分配失败标记")
@@ -558,6 +746,23 @@ def prepare_tts_tasks(sentences: list[dict], config: Config) -> list[dict]:
 # 第五步：Edge-TTS 合成中文语音
 # ============================================================
 
+def preprocess_tts_text(text: str) -> str:
+    """
+    预处理 TTS 文本，确保特殊词汇发音正确
+    """
+    import re
+
+    # C# 替换为 "C sharp"（edge-tts 不支持 SSML，直接替换文本）
+    text = re.sub(
+        r'C#([\d\.]*)',
+        r'C sharp\1',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    return text
+
+
 async def synthesize_with_edgetts(sentences: list[dict], config: Config, output_dir: str):
     """
     使用 Edge-TTS 逐句合成中文语音
@@ -574,8 +779,8 @@ async def synthesize_with_edgetts(sentences: list[dict], config: Config, output_
         seg_idx = s["seg_indices"][0]
         out_path = output_dir / f"{seg_idx:04d}.wav"
 
-        # 跳过已合成的（断点续传）
-        if out_path.exists() and out_path.stat().st_size > 1000:
+        # 跳过已合成的（仅当 resume_from_checkpoint=True 时）
+        if config.resume_from_checkpoint and out_path.exists() and out_path.stat().st_size > 1000:
             s["cn_audio_path"] = str(out_path)
             print(f"  ⏭️ 跳过 [{idx + 1}/{len(sentences)}]: 已存在")
             continue
@@ -586,13 +791,17 @@ async def synthesize_with_edgetts(sentences: list[dict], config: Config, output_
         rate_percent = int((1.0 / s["speed_ratio"] - 1) * 100)
         rate_str = f"{rate_percent:+}%" if rate_percent != 0 else "0%"
 
-        # 限制范围
-        rate_percent = max(-50, min(rate_percent, 50))
+        # 限制范围：最多加速30%，最多减速5%
+        rate_percent = max(-5, min(rate_percent, 30))
         rate_str = f"{rate_percent:+}%"
+
+        # 预处理文本，确保 C# 等词汇发音正确
+        raw_text = s.get("cn_text", "")
+        processed_text = preprocess_tts_text(raw_text)
 
         try:
             communicate = edge_tts.Communicate(
-                s.get("cn_text", ""),
+                processed_text,
                 voice=config.tts_voice,
                 rate=rate_str,
                 volume="+0%"
@@ -600,7 +809,7 @@ async def synthesize_with_edgetts(sentences: list[dict], config: Config, output_
             await communicate.save(str(out_path))
 
             s["cn_audio_path"] = str(out_path)
-            print(f"  ✅ [{idx + 1}/{len(sentences)}] rate={rate_str}: {s.get('cn_text', '')[:35]}...")
+            print(f"  ✅ [{idx + 1}/{len(sentences)}] rate={rate_str}: {raw_text[:35]}...")
 
         except Exception as e:
             print(f"  ❌ TTS 失败 [{idx + 1}]: {e}")
@@ -628,7 +837,7 @@ def stitch_audio_segments(sentences: list[dict], config: Config, output_path: st
     策略：
     1. 每个句子在其原始时间段内播放
     2. 如果中文语音比原时段短 → 前面正常说，后面补静音
-    3. 如果中文语音比原时段长 → TTS 已调速，或截断超出的部分
+    3. 如果中文语音比原时段长 → 不截断，保留完整内容，时间轴自然后移
     """
     from pydub import AudioSegment
     from pydub.effects import speedup
@@ -638,7 +847,7 @@ def stitch_audio_segments(sentences: list[dict], config: Config, output_path: st
     # 创建空白音频（用于累积）
     # 先确定总时长（最后一个句子的结束时间）
     total_duration = max(s["end"] for s in sentences)
-    print(f"  总时长: {total_duration:.2f} 秒")
+    print(f"  原始总时长: {total_duration:.2f} 秒")
 
     # 创建全零音频（毫秒）
     combined: Optional[AudioSegment] = None
@@ -661,10 +870,12 @@ def stitch_audio_segments(sentences: list[dict], config: Config, output_path: st
         if len(audio) < seg_duration_ms:
             silence = AudioSegment.silent(duration=seg_duration_ms - len(audio))
             audio = audio + silence
+            print(f"  📝 [{idx + 1}] 音频较短 {len(audio)}ms < {seg_duration_ms}ms，补静音")
 
-        # 如果音频比目标时段长 → 截断
+        # 如果音频比目标时段长 → 不截断，保留完整内容
         elif len(audio) > seg_duration_ms:
-            audio = audio[:seg_duration_ms]
+            overrun = len(audio) - seg_duration_ms
+            print(f"  📝 [{idx + 1}] 音频较长 {len(audio)}ms > {seg_duration_ms}ms，保留完整内容（超出 {overrun}ms）")
 
         # 累积到总音频
         if combined is None:
@@ -682,6 +893,13 @@ def stitch_audio_segments(sentences: list[dict], config: Config, output_path: st
                 combined = combined + silence
 
             combined = combined + audio
+
+    # 统计最终时长
+    if combined:
+        final_duration_ms = len(combined)
+        final_duration_s = final_duration_ms / 1000
+        if final_duration_s > total_duration:
+            print(f"  ⚠️ 最终时长 {final_duration_s:.2f}s 比原时长 {total_duration:.2f}s 长 {final_duration_s - total_duration:.2f}s")
 
         s["final_audio_path"] = s["cn_audio_path"]
 
@@ -734,7 +952,7 @@ def process_video(
 
     print(f"\n🎬 处理视频: {video_path.name}")
 
-    # Step 1: 提取原视频音频
+    # Step 1: 提取原视频音频（用于 BGM）
     print("  1️⃣ 提取原音频轨道...")
     subprocess.run([
         "ffmpeg", "-y", "-i", str(video_path),
@@ -770,11 +988,26 @@ def process_video(
 
     ffmpeg_args = ["ffmpeg", "-y"]
 
+    # 如果不保留原语音，需要移除原视频的音频流
+    if not config.keep_original_voice:
+        # 方案A: 先提取纯视频流（无音频）
+        pure_video_path = temp_dir / "pure_video.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-an",  # 移除音频
+            "-c:v", "copy",
+            str(pure_video_path)
+        ], capture_output=True)
+        video_input = str(pure_video_path)
+        print("  🔇 已移除原视频音频轨道")
+    else:
+        video_input = str(video_path)
+
     if config.burn_subtitles and chinese_srt_path and Path(chinese_srt_path).exists():
         # 烧录中文字幕（仅当配置启用时）
         print("  📝 烧录中文字幕...")
         ffmpeg_args.extend([
-            "-i", str(video_path),
+            "-i", video_input,
             "-i", str(audio_to_use),
             "-vf", f"subtitles='{chinese_srt_path}':force_style='FontSize=24,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,Outline=2'",
             "-map", "0:v:0",    # 只取主视频流（忽略封面等）
@@ -782,7 +1015,7 @@ def process_video(
         ])
     else:
         ffmpeg_args.extend([
-            "-i", str(video_path),
+            "-i", video_input,
             "-i", str(audio_to_use),
             "-map", "0:v:0",    # 只取主视频流（忽略封面等）
             "-map", "1:a",      # 使用新音频
@@ -868,7 +1101,7 @@ def main(
     temp_dir = temp_base / work_dir
     audio_dir = temp_dir / "audio"
 
-    # 创建目录
+    # 创建目录 
     temp_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1053,22 +1286,25 @@ if __name__ == "__main__":
         ollama_model="qwen2.5:14b",      # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
         tts_voice="zh-CN-YunxiNeural",   # TTS 语音：YunxiNeural(云希男声), YunyangNeural(云扬男声), XiaoxiaoNeural(晓晓女声)
         tts_delay=0.2,                    # TTS 请求延时（秒），避免被限速
-        keep_original_bgm=True,          # 是否保留原视频背景音乐
+        keep_original_bgm=False,          # 是否保留原视频背景音乐
         bgm_volume=0.25,                  # BGM 音量（0.0-1.0）
+        keep_original_voice=False,        # 是否保留原视频人声：False=完全移除，True=保留原音
         burn_subtitles=False,             # 是否烧录字幕到视频：False=外挂字幕，True=烧录到视频
         enable_checkpoint=True,           # 是否启用断点续传
-        resume_from_checkpoint=True,      # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
+        resume_from_checkpoint=False,     # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
     )
 
-    # 视频和字幕路径（放在 source 目录中）
-    source_dir = '/Users/iox/Desktop/msagent/source'
-    video_path = f'{source_dir}/[中文字幕]使用微软 Agent Framework 框架进行 C# Ai 开发/[P1]1. Welcome.mp4'
-    srt_path = f'{source_dir}/AI in C# using the Microsoft Agent Framework 2026.1/1 - Introduction to the course/1. Welcome.en_US.srt'
-    output_dir = "/Users/iox/Desktop/msagent/output"
+    # # 视频和字幕路径（放在 source 目录中）
+    # source_dir = '/Users/iox/Desktop/msagent/source'
+    # video_path = f'{source_dir}/[中文字幕]使用微软 Agent Framework 框架进行 C# Ai 开发/[P1]1. Welcome.mp4'
+    # srt_path = f'{source_dir}/AI in C# using the Microsoft Agent Framework 2026.1/1 - Introduction to the course/1. Welcome.en_US.srt'
+    # output_dir = "/Users/iox/Desktop/msagent/output"
 
-    main(
-        video_path=video_path,
-        srt_path=srt_path,
-        output_dir=output_dir,
-        config=config
-    )
+    # main(
+    #     video_path=video_path,
+    #     srt_path=srt_path,
+    #     output_dir=output_dir,
+    #     config=config
+    # )
+
+    
