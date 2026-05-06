@@ -23,6 +23,61 @@ from dataclasses import dataclass, asdict
 
 
 # ============================================================
+# 断点续传管理
+# ============================================================
+
+CHECKPOINT_FILE = "checkpoint.json"
+
+class CheckpointManager:
+    """断点续传管理器"""
+
+    def __init__(self, temp_dir: str, enable: bool = True):
+        self.temp_dir = Path(temp_dir)
+        self.checkpoint_file = self.temp_dir / CHECKPOINT_FILE
+        self.enable = enable
+        self.data = {}
+
+        if enable and self.checkpoint_file.exists():
+            try:
+                self.data = json.loads(self.checkpoint_file.read_text(encoding='utf-8'))
+                print(f"  📂 已加载检查点: {len(self.data)} 个步骤完成")
+            except Exception:
+                self.data = {}
+
+    def save(self):
+        """保存检查点"""
+        if not self.enable:
+            return
+        try:
+            self.checkpoint_file.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as e:
+            print(f"  ⚠️ 保存检查点失败: {e}")
+
+    def set_completed(self, step: str, data: dict = None):
+        """标记步骤已完成"""
+        if not self.enable:
+            return
+        self.data[step] = {"completed": True, "data": data}
+        self.save()
+
+    def is_completed(self, step: str) -> bool:
+        """检查步骤是否已完成"""
+        if not self.enable:
+            return False
+        return self.data.get(step, {}).get("completed", False)
+
+    def get_data(self, step: str) -> dict:
+        """获取步骤数据"""
+        return self.data.get(step, {}).get("data", {})
+
+    def clear(self):
+        """清除所有检查点"""
+        if self.checkpoint_file.exists():
+            self.checkpoint_file.unlink()
+        self.data = {}
+
+
+# ============================================================
 # 配置区
 # ============================================================
 
@@ -41,17 +96,17 @@ class Config:
     # DashScope API Key（use_local_llm=False 时需要）
     dashscope_key: str = ""
 
-    # TTS 配置
-    tts_voice: str = "zh-CN-XiaoxiaoNeural"  # 晓晓，教学推荐
-    # 其他可选：zh-CN-YunxiNeural（云希，男声）
-    #           zh-CN-XiaoyiNeural（晓伊，女声，年轻）
+    # TTS 语音配置
+    # 可用男声：zh-CN-YunxiNeural（云希，推荐）, zh-CN-YunyangNeural（云扬）
+    # 可用女声：zh-CN-XiaoxiaoNeural（晓晓）, zh-CN-XiaoyiNeural（晓伊）, zh-CN-XiaomoNeural（晓墨）
+    tts_voice: str = "zh-CN-YunxiNeural"  # 默认男声
 
     # 中文朗读速率（字/秒），用于估算时长
     chinese_reading_speed: float = 4.5  # 正常语速
 
     # 语速比例限制（防止失真）
-    speed_ratio_min: float = 0.6
-    speed_ratio_max: float = 1.4
+    speed_ratio_min: float = 0.6  # 最小语速（原速的60%）
+    speed_ratio_max: float = 1.4  # 最大语速（原速的140%）
 
     # Edge-TTS 延时（秒），避免请求过快被限
     tts_delay: float = 0.2
@@ -63,8 +118,15 @@ class Config:
     keep_original_bgm: bool = True  # 是否保留原视频背景音乐
     bgm_volume: float = 0.25  # BGM 音量（0.0-1.0）
 
+    # 字幕烧录配置
+    burn_subtitles: bool = False  # 是否烧录字幕到视频（False=使用外挂字幕）
+
     # 临时文件目录
     temp_dir: str = "temp"
+
+    # 断点续传配置
+    enable_checkpoint: bool = True  # 是否启用断点续传
+    resume_from_checkpoint: bool = True  # 默认重用中间文件，跳过已完成部分
 
 
 # ============================================================
@@ -708,22 +770,29 @@ def process_video(
 
     ffmpeg_args = ["ffmpeg", "-y"]
 
-    if chinese_srt_path and Path(chinese_srt_path).exists():
-        # 烧录中文字幕
+    if config.burn_subtitles and chinese_srt_path and Path(chinese_srt_path).exists():
+        # 烧录中文字幕（仅当配置启用时）
         print("  📝 烧录中文字幕...")
         ffmpeg_args.extend([
             "-i", str(video_path),
             "-i", str(audio_to_use),
             "-vf", f"subtitles='{chinese_srt_path}':force_style='FontSize=24,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,Outline=2'",
+            "-map", "0:v:0",    # 只取主视频流（忽略封面等）
+            "-map", "1:a",      # 使用新音频
         ])
     else:
         ffmpeg_args.extend([
             "-i", str(video_path),
             "-i", str(audio_to_use),
+            "-map", "0:v:0",    # 只取主视频流（忽略封面等）
+            "-map", "1:a",      # 使用新音频
         ])
 
     ffmpeg_args.extend([
-        "-c:v", "libx264" if chinese_srt_path else "copy",  # 烧录字幕需要重新编码视频
+        "-c:v", "libx264",  # 强制重新编码为 H.264，确保播放器兼容性
+        "-preset", "fast",   # 编码速度：ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+        "-crf", "23",        # 视频质量（0-51，越低越好），23 为默认质量
+        "-pix_fmt", "yuv420p",  # 强制转换为 yuv420p，确保兼容性
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
@@ -735,7 +804,9 @@ def process_video(
     if result.returncode == 0:
         print(f"  ✅ 视频生成完成: {output_path}")
     else:
-        print(f"  ❌ FFmpeg 失败: {result.stderr.decode()[:500]}")
+        error_msg = result.stderr.decode()[:800]
+        print(f"  ❌ FFmpeg 失败: {error_msg}")
+        raise RuntimeError(f"视频生成失败: {error_msg}")
 
     # Step 4: 复制字幕文件到 output 目录（与视频同名，方便播放器识别）
     if chinese_srt_path and Path(chinese_srt_path).exists():
@@ -767,6 +838,8 @@ def main(
     完整流水线：
     SRT → 拼接整句 → 翻译 → TTS → 音频拼接 → 视频合并
 
+    支持断点续传：中断后可跳过已完成步骤
+
     目录结构：
     - output/              # 最终输出（视频、字幕）
       └── {video_name}/    # 按视频名分目录
@@ -776,7 +849,8 @@ def main(
     - temp/                 # 临时文件（按视频名分目录）
       └── {video_name}/
           ├── audio/       # TTS 生成的音频片段
-          └── *.wav        # 中间音频文件
+          ├── *.wav        # 中间音频文件
+          └── checkpoint.json  # 断点记录
     """
     if config is None:
         config = Config()
@@ -802,6 +876,16 @@ def main(
     final_output_dir = output_dir / video_name
     final_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 初始化断点续传管理器
+    checkpoint = CheckpointManager(str(temp_dir), enable=config.enable_checkpoint)
+
+    # 流水线执行状态
+    pipeline_success = True
+
+    # 如果不禁用断点续传且不禁用 resume，打印提示
+    if config.enable_checkpoint and config.resume_from_checkpoint:
+        print("  💾 断点续传已启用")
+
     print("=" * 60)
     print("📺 英文视频中文配音流水线")
     print("=" * 60)
@@ -822,19 +906,29 @@ def main(
     print(f"  合并为 {len(sentences)} 个完整句子")
     for i, s in enumerate(sentences[:3]):
         print(f"    句 {i + 1}: {s['text'][:60]}...")
+    checkpoint.set_completed("step2", {"count": len(sentences)})
 
-    # Step 3: 翻译
+    # Step 3: 翻译（检查实际文件是否存在）
     print("\n🌐 Step 3: 翻译为中文...")
-    if config.use_local_llm:
-        base_url = config.ollama_base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        print(f"  使用 Ollama ({config.ollama_model}) @ {base_url}")
+    # 检查是否有有效翻译（所有句子都有cn_text且不是失败标记）
+    has_valid_translations = all(
+        s.get("cn_text") and "（翻译失败）" not in s.get("cn_text", "") and "[翻译失败]" not in s.get("cn_text", "")
+        for s in sentences
+    )
+    if config.resume_from_checkpoint and has_valid_translations:
+        print("  ⏩ 跳过（已存在翻译结果）")
     else:
-        print("  使用阿里云 DashScope API")
-    sentences = translate_sentences(sentences, config, str(temp_dir))
+        if config.use_local_llm:
+            base_url = config.ollama_base_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+            print(f"  使用 Ollama ({config.ollama_model}) @ {base_url}")
+        else:
+            print("  使用阿里云 DashScope API")
+        sentences = translate_sentences(sentences, config, str(temp_dir))
 
     # Step 4: 计算 TTS 语速
     print("\n⚡ Step 4: 计算 TTS 语速参数...")
     sentences = prepare_tts_tasks(sentences, config)
+    checkpoint.set_completed("step4", {"count": len(sentences)})
 
     # 统计
     speed_stats = {"加速": 0, "正常": 0, "减速": 0}
@@ -848,56 +942,79 @@ def main(
             speed_stats["正常"] += 1
     print(f"  统计: {speed_stats['减速']} 句需减速, {speed_stats['正常']} 句正常, {speed_stats['加速']} 句需加速")
 
-    # Step 5: TTS 合成
+    # Step 5: TTS 合成（检查实际文件是否存在）
     print("\n🔊 Step 5: Edge-TTS 合成中文语音...")
     print(f"  语音: {config.tts_voice}, 延时: {config.tts_delay}s")
-    sentences = sync_synthesize_with_edgetts(sentences, config, str(audio_dir))
 
-    # Step 6: 拼接音频
+    # 检查是否所有音频文件都存在
+    all_audio_exist = all(
+        s.get("cn_audio_path") and Path(s["cn_audio_path"]).exists() and Path(s["cn_audio_path"]).stat().st_size > 1000
+        for s in sentences
+    )
+    if config.resume_from_checkpoint and all_audio_exist:
+        print("  ⏩ 跳过（已存在 TTS 音频）")
+    else:
+        sentences = sync_synthesize_with_edgetts(sentences, config, str(audio_dir))
+
+    # Step 6: 拼接音频（检查实际文件是否存在）
     print("\n📦 Step 6: 拼接音频片段...")
     chinese_audio = temp_dir / "chinese_audio.wav"
-    stitch_audio_segments(sentences, config, str(chinese_audio))
 
-    # Step 7: 合并视频
+    if config.resume_from_checkpoint and chinese_audio.exists() and chinese_audio.stat().st_size > 1000:
+        print("  ⏩ 跳过（已存在拼接音频）")
+    else:
+        stitch_audio_segments(sentences, config, str(chinese_audio))
+
+    # Step 7: 合并视频（检查实际文件是否存在）
+    final_video = final_output_dir / f"{video_name}.cn.mp4"
     if video_path.exists():
         print("\n🎬 Step 7: 合并视频和音频...")
 
-        # 生成中文字幕文件（用于烧录和复制）
-        chinese_srt_path = temp_dir / "chinese.srt"
-        chinese_segments = []
-        for s in sentences:
-            cn_text = s.get("cn_text", "")
-            if cn_text and "（翻译失败）" not in cn_text and "[翻译失败]" not in cn_text:
-                chinese_segments.append({
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": cn_text
-                })
-        if chinese_segments:
-            save_srt(chinese_segments, str(chinese_srt_path))
+        if config.resume_from_checkpoint and final_video.exists() and final_video.stat().st_size > 1000:
+            print("  ⏩ 跳过（视频已生成）")
+        else:
+            # 生成中文字幕文件（用于烧录和复制）
+            chinese_srt_path = temp_dir / "chinese.srt"
+            chinese_segments = []
+            for s in sentences:
+                cn_text = s.get("cn_text", "")
+                if cn_text and "（翻译失败）" not in cn_text and "[翻译失败]" not in cn_text:
+                    chinese_segments.append({
+                        "start": s["start"],
+                        "end": s["end"],
+                        "text": cn_text
+                    })
+            if chinese_segments:
+                save_srt(chinese_segments, str(chinese_srt_path))
 
-        # 生成英文字幕文件（从原文翻译后恢复）
-        english_srt_path = temp_dir / "english.srt"
-        english_segments = []
-        for s in sentences:
-            en_text = s.get("text", "")
-            if en_text:
-                english_segments.append({
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": en_text
-                })
-        if english_segments:
-            save_srt(english_segments, str(english_srt_path))
+            # 生成英文字幕文件（从原文翻译后恢复）
+            english_srt_path = temp_dir / "english.srt"
+            english_segments = []
+            for s in sentences:
+                en_text = s.get("text", "")
+                if en_text:
+                    english_segments.append({
+                        "start": s["start"],
+                        "end": s["end"],
+                        "text": en_text
+                    })
+            if english_segments:
+                save_srt(english_segments, str(english_srt_path))
 
-        # 最终视频输出到 output/{video_name}/
-        final_video = final_output_dir / f"{video_name}.cn.mp4"
-        process_video(
-            str(video_path), str(chinese_audio), str(final_video), config,
-            chinese_srt_path=str(chinese_srt_path) if chinese_segments else None,
-            english_srt_path=str(english_srt_path) if english_segments else None,
-            temp_dir=str(temp_dir)
-        )
+            # 最终视频输出到 output/{video_name}/
+            try:
+                process_video(
+                    str(video_path), str(chinese_audio), str(final_video), config,
+                    chinese_srt_path=str(chinese_srt_path) if chinese_segments else None,
+                    english_srt_path=str(english_srt_path) if english_segments else None,
+                    temp_dir=str(temp_dir)
+                )
+                checkpoint.set_completed("step7", {"path": str(final_video)})
+            except RuntimeError as e:
+                print(f"\n  ❌ 视频生成失败: {e}")
+                print("  ⚠️ 请检查 FFmpeg 错误信息，修复后重新运行（设置 resume_from_checkpoint=True 跳过已完成步骤）")
+                pipeline_success = False
+                # 不 return，继续保存数据但标记失败
     else:
         print("\n⚠️ 视频文件不存在，跳过视频合并步骤")
         print(f"  中文音频已生成: {chinese_audio}")
@@ -917,7 +1034,10 @@ def main(
     print(f"\n💾 处理数据已保存: {data_path}")
 
     print("\n" + "=" * 60)
-    print("✅ 流水线完成！")
+    if pipeline_success:
+        print("✅ 流水线完成！")
+    else:
+        print("❌ 流水线执行失败！请检查上方错误信息。")
     print("=" * 60)
 
 
@@ -928,13 +1048,16 @@ def main(
 if __name__ == "__main__":
     # 示例配置
     config = Config(
-        use_local_llm=True,          # True=本地 Ollama，False=云端 DashScope
-        ollama_base_url="http://192.168.0.80:11434",  # 远程 Ollama 地址
-        ollama_model="qwen2.5:14b",    # 或 qwen2.5:3b（更快）
-        tts_voice="zh-CN-XiaoxiaoNeural",
-        tts_delay=0.2,
-        keep_original_bgm=True,
-        bgm_volume=0.25,
+        use_local_llm=True,             # 翻译方式：True=本地 Ollama，False=云端 DashScope
+        ollama_base_url="http://192.168.0.80:11434",  # Ollama 远程服务器地址
+        ollama_model="qwen2.5:14b",      # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
+        tts_voice="zh-CN-YunxiNeural",   # TTS 语音：YunxiNeural(云希男声), YunyangNeural(云扬男声), XiaoxiaoNeural(晓晓女声)
+        tts_delay=0.2,                    # TTS 请求延时（秒），避免被限速
+        keep_original_bgm=True,          # 是否保留原视频背景音乐
+        bgm_volume=0.25,                  # BGM 音量（0.0-1.0）
+        burn_subtitles=False,             # 是否烧录字幕到视频：False=外挂字幕，True=烧录到视频
+        enable_checkpoint=True,           # 是否启用断点续传
+        resume_from_checkpoint=True,      # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
     )
 
     # 视频和字幕路径（放在 source 目录中）
