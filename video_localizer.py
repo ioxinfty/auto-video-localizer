@@ -11,9 +11,15 @@ pip install edge-tts pydub ollama faster-whisper python-dotenv
 3. 修改底部的 MAIN 函数中的路径，运行即可
 """
 
+__version__ = "1.0.0"
+
 import re
 import json
 import os
+
+# 加载 .env 环境变量文件
+from dotenv import load_dotenv
+load_dotenv()
 import shutil
 import subprocess
 import asyncio
@@ -1402,7 +1408,7 @@ if __name__ == "__main__":
     # 配置
     config = Config(
         use_local_llm=True,            # 翻译方式：True=本地 Ollama，False=云端 DashScope
-        ollama_base_url="http://192.168.0.80:11434",  # Ollama 服务器地址
+        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),  # Ollama 服务器地址
         ollama_model="qwen2.5:14b",     # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
         tts_voice="zh-CN-YunxiNeural",  # TTS 语音：YunxiNeural(云希男声，推荐), YunyangNeural(云扬), XiaoxiaoNeural(晓晓女声)
         tts_delay=0.2,                  # TTS 请求延时（秒），避免被限速
