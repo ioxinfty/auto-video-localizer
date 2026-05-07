@@ -499,17 +499,43 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
             for j, s in enumerate(batch)
         ])
 
+        # 强制保留字列表（翻译时必须原样保留）
+        PRESERVE_TERMS = [
+            # Agent 相关
+            "agent", "Agent", "agents", "Agents",
+            # 框架和技术
+            "framework", "Framework",
+            "LLM", "API", "SDK",
+            "endpoint", "endpoints",
+            "webhook", "webhooks",
+            "workflow", "workflows",
+            # 平台和工具
+            "GitHub", "NuGet",
+            "Azure", "OpenAI", "Anthropic",
+            "Semantic Kernel",
+            # 语言和框架
+            "C#", ".NET", "Python", "JavaScript", "TypeScript",
+            # 其他常见术语
+            "JSON", "XML", "HTML", "CSS", "REST",
+            "CLI", "GUI", "IDE",
+            "debug", "Debug", "Debugging",
+            "config", "Config", "configuration",
+        ]
+        preserve_list = ", ".join(PRESERVE_TERMS)
+
         prompt = f"""你是一个专业的英文教学视频字幕翻译专家。请将以下英文字幕翻译为中文，要求：
 
 1. 保持教学语气，自然、清晰、易懂
-2. 保留专业术语不翻译（如 Agent, LLM, API, SDK, GitHub, NuGet, C# 等）
+2. 【强制要求】以下专业术语必须原样保留到译文中，不得翻译、不得用中文替换、不得用括号解释：
+   {preserve_list}
+   如违反此规则属于严重错误。
 3. 适当增补语气词，使中文听起来更自然（如"好"、"那么"、"我们来看"）
 4. 按序号逐条返回，格式：序号. 中文翻译
 5. 不要添加多余解释
 
-{'-' * 40}
+{'=' * 50}
 {batch_texts}
-{'-' * 40}
+{'=' * 50}
 返回示例：
 1. 让我们开始使用 C# Agent 框架
 2. 现在我们已经建立了原始连接
@@ -594,7 +620,26 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
 def _retry_single_translation(client, text: str, config: Config) -> str:
     """单独重试翻译单条文本"""
     try:
-        prompt = f"""翻译以下英文为中文教学语气，保留专业术语：
+        # 强制保留字列表
+        PRESERVE_TERMS = [
+            "agent", "Agent", "agents", "Agents",
+            "framework", "Framework",
+            "LLM", "API", "SDK",
+            "endpoint", "endpoints",
+            "webhook", "webhooks",
+            "workflow", "workflows",
+            "GitHub", "NuGet",
+            "Azure", "OpenAI", "Anthropic",
+            "Semantic Kernel",
+            "C#", ".NET", "Python", "JavaScript", "TypeScript",
+            "JSON", "XML", "HTML", "CSS", "REST",
+            "CLI", "GUI", "IDE",
+            "debug", "Debug", "Debugging",
+            "config", "Config", "configuration",
+        ]
+        preserve_list = ", ".join(PRESERVE_TERMS)
+
+        prompt = f"""翻译以下英文为中文教学语气，【强制要求】以下专业术语必须原样保留：{preserve_list}
 
 原文: {text}
 
@@ -645,7 +690,25 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
         batch_idx = i // BATCH_SIZE + 1
         batch_texts = "\n".join([f"{j + 1}. {s['text']}" for j, s in enumerate(batch)])
 
-        prompt = f"翻译为教学语气中文，保留专业术语：\n{batch_texts}"
+        # 强制保留字列表
+        PRESERVE_TERMS = [
+            "agent", "Agent", "agents", "Agents",
+            "framework", "Framework",
+            "LLM", "API", "SDK",
+            "endpoint", "endpoints",
+            "webhook", "webhooks",
+            "workflow", "workflows",
+            "GitHub", "NuGet",
+            "Azure", "OpenAI", "Anthropic",
+            "Semantic Kernel",
+            "C#", ".NET", "Python", "JavaScript", "TypeScript",
+            "JSON", "XML", "HTML", "CSS", "REST",
+            "CLI", "GUI", "IDE",
+            "debug", "Debug", "Debugging",
+            "config", "Config", "configuration",
+        ]
+        preserve_list = ", ".join(PRESERVE_TERMS)
+        prompt = f"翻译为教学语气中文，【强制要求】以下专业术语必须原样保留：{preserve_list}\n{batch_texts}"
 
         raw_response = None
         last_error = None
@@ -728,7 +791,25 @@ def _retry_single_translation_dashscope(text: str, config: Config) -> str:
         import dashscope
         from dashscope import Generation
 
-        prompt = f"翻译为教学语气中文，保留专业术语：\n{text}"
+        # 强制保留字列表
+        PRESERVE_TERMS = [
+            "agent", "Agent", "agents", "Agents",
+            "framework", "Framework",
+            "LLM", "API", "SDK",
+            "endpoint", "endpoints",
+            "webhook", "webhooks",
+            "workflow", "workflows",
+            "GitHub", "NuGet",
+            "Azure", "OpenAI", "Anthropic",
+            "Semantic Kernel",
+            "C#", ".NET", "Python", "JavaScript", "TypeScript",
+            "JSON", "XML", "HTML", "CSS", "REST",
+            "CLI", "GUI", "IDE",
+            "debug", "Debug", "Debugging",
+            "config", "Config", "configuration",
+        ]
+        preserve_list = ", ".join(PRESERVE_TERMS)
+        prompt = f"翻译为教学语气中文，【强制要求】以下专业术语必须原样保留：{preserve_list}\n{text}"
 
         response = Generation.call(
             model="qwen-turbo",
