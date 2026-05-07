@@ -291,7 +291,71 @@ def merge_segments_to_sentences(segments: list[dict]) -> list[dict]:
         current["text"] = current["text"].strip()
         sentences.append(current)
 
+    # 分割过长的句子（超过 150 字按逗号分段）
+    sentences = split_long_sentences(sentences)
+
     return sentences
+
+
+def split_long_sentences(sentences: list[dict], max_chars: int = 150) -> list[dict]:
+    """
+    将过长的句子按逗号分割成多个短句。
+
+    Args:
+        sentences: 句子列表
+        max_chars: 最大字符数，超过则按逗号分割
+    """
+    result = []
+    for sent in sentences:
+        text = sent["text"]
+        if len(text) <= max_chars:
+            result.append(sent)
+            continue
+
+        # 按逗号分割
+        parts = text.split(",")
+        if len(parts) < 2:
+            # 没有逗号，直接保留
+            result.append(sent)
+            continue
+
+        # 估算每段时长
+        total_duration = sent["end"] - sent["start"]
+        total_chars = sum(len(p.strip()) for p in parts)
+        if total_chars == 0:
+            result.append(sent)
+            continue
+
+        current_start = sent["start"]
+        current_text = ""
+
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+
+            if current_text:
+                current_text += ", " + part
+            else:
+                current_text = part
+
+            # 如果当前段落足够长，或者这是最后一段
+            if len(current_text) >= max_chars or i == len(parts) - 1:
+                current_chars = len(current_text)
+                current_duration = (current_chars / total_chars) * total_duration
+                current_end = current_start + current_duration
+
+                result.append({
+                    "seg_indices": sent.get("seg_indices", []),
+                    "text": current_text,
+                    "start": round(current_start, 3),
+                    "end": round(current_end, 3),
+                })
+
+                current_start = current_end
+                current_text = ""
+
+    return result
 
 
 def _is_incomplete_phrase(text: str) -> bool:

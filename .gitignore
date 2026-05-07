@@ -17,6 +17,9 @@ temp/
 # 输出目录
 output/
 
+# 上传目录
+upload/
+
 # macOS
 .DS_Store
 .AppleDouble
