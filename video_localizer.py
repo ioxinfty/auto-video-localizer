@@ -3,7 +3,14 @@
 完整流水线脚本
 
 依赖安装：
-pip install edge-tts pydub ollama faster-whisper python-dotenv
+pip install -r requirements.txt
+
+requirements.txt 包含：
+- edge-tts       # 微软语音合成（无需 API Key）
+- pydub          # 音频处理
+- ollama         # 本地 LLM 翻译
+- dashscope      # 阿里云翻译（可选）
+- python-dotenv  # 环境变量
 
 使用说明：
 1. 配置好 Ollama（本地翻译）或 DashScope API Key（云端翻译）
@@ -237,47 +244,34 @@ class Config:
 # 第一步：读取 SRT 文件
 # ============================================================
 
+def load_subtitle(subtitle_path: str) -> list[dict]:
+    """根据文件后缀自动选择 SRT 或 VTT 解析器"""
+    if subtitle_path.lower().endswith(".vtt"):
+        return load_vtt(subtitle_path)
+    return load_srt(subtitle_path)
+
+
 def load_srt(srt_path: str) -> list[dict]:
-    """
-    读取 SRT/VTT 文件，返回结构化列表
-    """
+    """读取 SRT 文件，返回结构化列表"""
     segments = []
     with open(srt_path, "r", encoding="utf-8") as f:
         content = f.read().strip()
-
-    # 跳过 WEBVTT 头
-    if content.startswith("WEBVTT"):
-        # 跳过 WEBVTT 头和空行
-        lines = content.split("\n")
-        start_idx = 0
-        for i, line in enumerate(lines):
-            if line.strip() and not line.startswith("WEBVTT"):
-                start_idx = i
-                break
-        content = "\n".join(lines[start_idx:])
 
     blocks = re.split(r"\n\n+", content)
     for block in blocks:
         lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
         if len(lines) < 3:
             continue
-
-        # 解析序号（可能是纯数字，也可能在 NOTE 块里）
         try:
             idx = int(lines[0])
         except ValueError:
             continue
-
-        # 解析时间戳 "00:00:00.710 --> 00:00:03.730"
-        time_line = lines[1]
-        if "-->" not in time_line:
+        if "-->" not in lines[1]:
             continue
-
-        start_str, end_str = time_line.split("-->")
+        start_str, end_str = lines[1].split("-->")
         start = srt_time_to_seconds(start_str.strip())
         end = srt_time_to_seconds(end_str.strip())
         text = " ".join(lines[2:]).strip()
-
         if text:
             segments.append({
                 "index": idx,
@@ -286,7 +280,54 @@ def load_srt(srt_path: str) -> list[dict]:
                 "text": text,
                 "duration": round(end - start, 3)
             })
+    return segments
 
+
+def load_vtt(vtt_path: str) -> list[dict]:
+    """读取 VTT 文件，返回结构化列表"""
+    segments = []
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+
+    # 跳过 WEBVTT 头及元数据行（Kind: / Language: 等），直到正文时间戳
+    lines = content.split("\n")
+    start_idx = 0
+    # 跳过 WEBVTT 行本身
+    for i, line in enumerate(lines):
+        if line.strip() == "WEBVTT":
+            start_idx = i + 1
+            break
+    # 跳过元数据行，直到遇到空行或时间戳行
+    while start_idx < len(lines):
+        line = lines[start_idx].strip()
+        if line == "":
+            start_idx += 1
+            break
+        if "-->" in line:
+            break
+        start_idx += 1
+    content = "\n".join(lines[start_idx:])
+
+    blocks = re.split(r"\n\n+", content)
+    for block in blocks:
+        lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+        # VTT 无序号，首行即时间戳
+        if "-->" not in lines[0]:
+            continue
+        start_str, end_str = lines[0].split("-->")
+        start = srt_time_to_seconds(start_str.strip())
+        end = srt_time_to_seconds(end_str.strip())
+        text = " ".join(lines[1:]).strip()
+        if text:
+            segments.append({
+                "index": 0,
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": text,
+                "duration": round(end - start, 3)
+            })
     return segments
 
 
@@ -1321,9 +1362,9 @@ def main(
     print(f"  输出目录: {final_output_dir}")
     print("=" * 60)
 
-    # Step 1: 读取 SRT
-    print("\n📖 Step 1: 读取 SRT 文件...")
-    segments = load_srt(str(srt_path))
+    # Step 1: 读取字幕文件
+    print("\n📖 Step 1: 读取字幕文件...")
+    segments = load_subtitle(str(srt_path))
     print(f"  读取到 {len(segments)} 个字幕片段")
 
     # Step 2: 拼接成完整句子
@@ -1471,144 +1512,27 @@ def main(
 # 入口
 # ============================================================
 
-# ============================================================
-# 批量处理队列
-# ============================================================
-
-def get_ms_agent_batch_queue(output_dir: str, skip_completed: bool = True) -> list[dict]:
-    """
-    获取微软 Agent Framework 课程的批量处理队列。
-    
-    Args:
-        output_dir: 输出目录
-        skip_completed: 是否跳过已完成的视频（通过检查 .cn.mp4 是否存在判断）
-    返回格式: [{"seq": 序号, "video": 视频路径, "srt": 字幕路径}, ...]
-    """
-    import re
-    from pathlib import Path
-
-    source_dir = '/Users/iox/Desktop/msagent/source'
-    video_base = f'{source_dir}/[中文字幕]使用微软 Agent Framework 框架进行 C# Ai 开发'
-    srt_base = f'{source_dir}/AI in C# using the Microsoft Agent Framework 2026.1'
-
-    # 1. 收集所有视频文件并提取序号
-    video_files = {}
-    for f in Path(video_base).glob("*.mp4"):
-        m = re.match(r'\[P\d*\]?(\d+)\.\s*(.+)\.mp4$', f.name)
-        if m:
-            num = int(m.group(1))
-            video_files[num] = str(f)
-
-    # 2. 收集所有字幕文件并提取序号
-    srt_files = {}
-    for srt_path in Path(srt_base).rglob("*.en_US.srt"):
-        m = re.match(r'(\d+)\.\s*(.+)\.en_US\.srt$', srt_path.name)
-        if m:
-            num = int(m.group(1))
-            srt_files[num] = str(srt_path)
-
-    # 3. 收集已完成的视频序号
-    completed_seqs = set()
-    if skip_completed:
-        for out_path in Path(output_dir).iterdir():
-            if out_path.is_dir():
-                mp4_file = out_path / f"{out_path.name}.cn.mp4"
-                if mp4_file.exists() and mp4_file.stat().st_size > 1000:
-                    # 从目录名提取序号，如 "[P1]1. Welcome" -> 1
-                    m = re.match(r'\[P\d*\]?(\d+)', out_path.name)
-                    if m:
-                        completed_seqs.add(int(m.group(1)))
-
-    # 4. 按序号配对 (1 -> 52)，跳过已完成的
-    task_list = []
-    skipped = 0
-    for num in range(1, 53):
-        if num in video_files and num in srt_files:
-            if skip_completed and num in completed_seqs:
-                skipped += 1
-                continue
-            task_list.append({
-                "seq": num,
-                "video": video_files[num],
-                "srt": srt_files[num],
-            })
-        else:
-            print(f"⚠️ 序号 {num} 配对缺失: video={num in video_files}, srt={num in srt_files}")
-
-    if skipped > 0:
-        print(f"⏭️ 跳过 {skipped} 个已完成视频")
-
-    return task_list
-
-
-def run_batch_process(config: Config, output_dir: str):
-    """
-    批量处理队列中的所有视频。
-    """
-    task_list = get_ms_agent_batch_queue(output_dir)
-    print(f"📋 共配对 {len(task_list)}/52 个任务")
-    for t in task_list[:3]:
-        print(f"   [{t['seq']}] {Path(t['video']).name} ↔ {Path(t['srt']).name}")
-    if len(task_list) > 3:
-        print(f"   ...")
-
-    for idx, task in enumerate(task_list):
-        seq = task["seq"]
-        video_path = task["video"]
-        srt_path = task["srt"]
-        video_name = Path(video_path).stem  # 如 "[P1]1. Welcome"
-
-        print(f"\n{'='*70}")
-        print(f"🎬 进度: [{idx + 1}/{len(task_list)}] 序号 {seq}")
-        print(f"📹 视频: {Path(video_path).name}")
-        print(f"📄 字幕: {Path(srt_path).name}")
-        print(f"{'='*70}")
-
-        # 如果 resume_from_checkpoint=True，检查是否已有输出
-        if config.resume_from_checkpoint:
-            final_video = Path(output_dir) / video_name / f"{video_name}.cn.mp4"
-            if final_video.exists() and final_video.stat().st_size > 1000:
-                print(f"  ⏭️ 已存在输出文件，跳过: {final_video.name}")
-                continue
-
-        try:
-            main(
-                video_path=video_path,
-                srt_path=srt_path,
-                output_dir=output_dir,
-                config=config,
-            )
-        except Exception as e:
-            print(f"❌ [{seq}] 处理失败: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    print(f"\n🎉 全部完成! 共处理 {len(task_list)} 个视频")
-
-
-# ============================================================
-# 入口
-# ============================================================
-
 if __name__ == "__main__":
     # 配置
     config = Config(
         use_local_llm=True,            # 翻译方式：True=本地 Ollama，False=云端 DashScope
-        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),  # Ollama 服务器地址
-        ollama_model="qwen2.5:14b",     # Ollama 模型：qwen2.5:14b（质量高）, qwen2.5:7b（速度快）
-        tts_voice="zh-CN-YunxiNeural",  # TTS 语音：YunxiNeural(云希男声，推荐), YunyangNeural(云扬), XiaoxiaoNeural(晓晓女声)
-        tts_delay=0.2,                  # TTS 请求延时（秒），避免被限速
-        keep_original_bgm=False,       # 是否保留原视频背景音乐
-        bgm_volume=0.25,               # BGM 音量（0.0-1.0）
-        keep_original_voice=False,     # 是否保留原视频人声：False=完全移除，True=保留原音
-        burn_subtitles=False,          # 是否烧录字幕到视频：False=外挂字幕，True=烧录到视频
+        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+        ollama_model="qwen2.5:14b",     # Ollama 模型
+        tts_voice="zh-CN-YunxiNeural",  # TTS 语音
+        tts_delay=0.2,                  # TTS 请求延时
+        keep_original_bgm=False,        # 是否保留原视频背景音乐
+        bgm_volume=0.25,               # BGM 音量
+        keep_original_voice=False,     # 是否保留原视频人声
+        burn_subtitles=False,          # 是否烧录字幕到视频
         enable_checkpoint=True,        # 是否启用断点续传
-        resume_from_checkpoint=True,   # 是否从断点恢复：True=跳过已完成步骤，False=全部重新生成
-        speed_ratio_max=1.0,          # 语速上限：1.0=不降速（最多保持原速），1.05=最多减速5%
+        resume_from_checkpoint=True,   # 是否从断点恢复
+        speed_ratio_max=1.0,          # 语速上限
     )
 
-    output_dir = "/Users/iox/Desktop/msagent/output"
-
-    # 批量处理
-    run_batch_process(config, output_dir)
+    # 单视频处理示例
+    main(
+        video_path="/path/to/video.mp4",
+        srt_path="/path/to/subtitle.en_US.srt",
+        output_dir="/Users/iox/Desktop/msagent/output",
+        config=config,
+    )
