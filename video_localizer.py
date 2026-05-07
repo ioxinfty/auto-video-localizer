@@ -29,6 +29,100 @@ from dataclasses import dataclass, asdict
 
 
 # ============================================================
+# 翻译保留字配置
+# ============================================================
+
+# 强制保留字列表（翻译时必须原样保留）
+# 注意：大小写敏感，每个变体都要列出
+PRESERVE_TERMS = [
+    # Agent 相关
+    "agent", "Agent", "agents", "Agents",
+    # 框架和技术
+    "framework", "Framework",
+    "LLM", "API", "SDK",
+    "endpoint", "endpoints",
+    "webhook", "webhooks",
+    "workflow", "workflows",
+    # 平台和工具
+    "GitHub", "NuGet",
+    "Azure", "OpenAI", "Anthropic",
+    "Semantic Kernel",
+    # 语言和框架
+    "C#", ".NET", "Python", "JavaScript", "TypeScript",
+    # 其他常见术语
+    "JSON", "XML", "HTML", "CSS", "REST",
+    "CLI", "GUI", "IDE",
+    "debug", "Debug", "Debugging",
+    "config", "Config", "configuration",
+]
+
+
+def mark_preserved_terms(text: str, terms: list[str] = None) -> tuple[str, list[tuple[str, str]]]:
+    """
+    用特殊标记包裹保留字，以便翻译后能还原。
+
+    Args:
+        text: 原始英文文本
+        terms: 保留字列表，默认使用 PRESERVE_TERMS
+
+    Returns:
+        (标记后的文本, [(marker, original_text), ...] 映射列表)
+    """
+    if terms is None:
+        terms = PRESERVE_TERMS
+
+    # 按长度降序排列，优先匹配长的词（如 "Semantic Kernel" > "Kernel"）
+    terms_sorted = sorted(terms, key=len, reverse=True)
+
+    markers = []  # [(marker, original_text), ...]
+    marked_text = text
+
+    for term in terms_sorted:
+        # 构建唯一标记
+        marker_id = len(markers)
+        marker = f"__KEEP{marker_id:03d}__"
+
+        # 使用正则进行大小写敏感替换
+        # 为了保留原文的大小写，我们在替换时使用原始 term
+        pattern = re.escape(term)
+
+        # 找到所有匹配
+        for match in re.finditer(pattern, marked_text):
+            original = match.group()
+            markers.append((marker, original))
+            # 替换这个匹配（只替换第一个出现的）
+            marked_text = marked_text.replace(original, marker, 1)
+            # 生成下一个唯一标记
+            marker_id = len(markers)
+            marker = f"__KEEP{marker_id:03d}__"
+
+    return marked_text, markers
+
+
+def restore_preserved_terms(text: str, markers: list[tuple[str, str]]) -> str:
+    """
+    将翻译结果中的标记还原为原始保留字。
+
+    Args:
+        text: 翻译后的文本（可能包含 __KEEP###__ 标记）
+        markers: [(marker, original_text), ...] 映射列表
+
+    Returns:
+        还原后的文本
+    """
+    result = text
+
+    for marker, original in markers:
+        if marker in result:
+            result = result.replace(marker, original)
+        else:
+            # 标记被 LLM 吃掉了（但保留了英文原词），这是正常的不需要处理
+            pass
+
+    return result
+
+
+# ============================================================
 # 断点续传管理
 # ============================================================
 
@@ -494,33 +588,17 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
     for i in range(0, len(sentences), BATCH_SIZE):
         batch = sentences[i:i + BATCH_SIZE]
         batch_idx = i // BATCH_SIZE + 1
-        batch_texts = "\n".join([
-            f"{j + 1}. {s['text']}"
-            for j, s in enumerate(batch)
-        ])
 
-        # 强制保留字列表（翻译时必须原样保留）
-        PRESERVE_TERMS = [
-            # Agent 相关
-            "agent", "Agent", "agents", "Agents",
-            # 框架和技术
-            "framework", "Framework",
-            "LLM", "API", "SDK",
-            "endpoint", "endpoints",
-            "webhook", "webhooks",
-            "workflow", "workflows",
-            # 平台和工具
-            "GitHub", "NuGet",
-            "Azure", "OpenAI", "Anthropic",
-            "Semantic Kernel",
-            # 语言和框架
-            "C#", ".NET", "Python", "JavaScript", "TypeScript",
-            # 其他常见术语
-            "JSON", "XML", "HTML", "CSS", "REST",
-            "CLI", "GUI", "IDE",
-            "debug", "Debug", "Debugging",
-            "config", "Config", "configuration",
-        ]
+        # 对每条文本进行标记，保存原始文本和标记映射
+        batch_markers = []  # [(original_text, marked_text, markers), ...]
+        marked_lines = []
+        for j, s in enumerate(batch):
+            original_text = s['text']
+            marked_text, markers = mark_preserved_terms(original_text)
+            batch_markers.append((original_text, marked_text, markers))
+            marked_lines.append(f"{j + 1}. {marked_text}")
+
+        batch_texts = "\n".join(marked_lines)
         preserve_list = ", ".join(PRESERVE_TERMS)
 
         prompt = f"""你是一个专业的英文教学视频字幕翻译专家。请将以下英文字幕翻译为中文，要求：
@@ -575,10 +653,13 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
             success_count = sum(1 for t in translations if t and "（翻译失败）" not in t)
             print(f"  📥 批次 {batch_idx} 解析完成: {success_count}/{len(batch)} 条成功")
 
-            # 先记录翻译结果
+            # 先记录翻译结果，并还原保留字
             for j, t in enumerate(translations):
                 if j < len(batch):
-                    sentences[i + j]["cn_text"] = t.strip()
+                    # 还原保留字
+                    _, _, markers = batch_markers[j]
+                    restored = restore_preserved_terms(t.strip(), markers)
+                    sentences[i + j]["cn_text"] = restored
 
             # 单独重试失败的翻译
             failed_indices = []
@@ -587,7 +668,7 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
                     failed_indices.append(j)
                     print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}] 失败: \"{batch[j]['text']}\"")
 
-            # 批量重试失败的翻译
+            # 批量重试失败的翻译（单条重试不需要标记，因为是单独翻译）
             for j in failed_indices:
                 retry_translation = _retry_single_translation(client, batch[j]['text'], config)
                 if retry_translation:
@@ -620,23 +701,6 @@ def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str 
 def _retry_single_translation(client, text: str, config: Config) -> str:
     """单独重试翻译单条文本"""
     try:
-        # 强制保留字列表
-        PRESERVE_TERMS = [
-            "agent", "Agent", "agents", "Agents",
-            "framework", "Framework",
-            "LLM", "API", "SDK",
-            "endpoint", "endpoints",
-            "webhook", "webhooks",
-            "workflow", "workflows",
-            "GitHub", "NuGet",
-            "Azure", "OpenAI", "Anthropic",
-            "Semantic Kernel",
-            "C#", ".NET", "Python", "JavaScript", "TypeScript",
-            "JSON", "XML", "HTML", "CSS", "REST",
-            "CLI", "GUI", "IDE",
-            "debug", "Debug", "Debugging",
-            "config", "Config", "configuration",
-        ]
         preserve_list = ", ".join(PRESERVE_TERMS)
 
         prompt = f"""翻译以下英文为中文教学语气，【强制要求】以下专业术语必须原样保留：{preserve_list}
@@ -688,25 +752,17 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
     for i in range(0, len(sentences), BATCH_SIZE):
         batch = sentences[i:i + BATCH_SIZE]
         batch_idx = i // BATCH_SIZE + 1
-        batch_texts = "\n".join([f"{j + 1}. {s['text']}" for j, s in enumerate(batch)])
 
-        # 强制保留字列表
-        PRESERVE_TERMS = [
-            "agent", "Agent", "agents", "Agents",
-            "framework", "Framework",
-            "LLM", "API", "SDK",
-            "endpoint", "endpoints",
-            "webhook", "webhooks",
-            "workflow", "workflows",
-            "GitHub", "NuGet",
-            "Azure", "OpenAI", "Anthropic",
-            "Semantic Kernel",
-            "C#", ".NET", "Python", "JavaScript", "TypeScript",
-            "JSON", "XML", "HTML", "CSS", "REST",
-            "CLI", "GUI", "IDE",
-            "debug", "Debug", "Debugging",
-            "config", "Config", "configuration",
-        ]
+        # 对每条文本进行标记，保存原始文本和标记映射
+        batch_markers = []  # [(original_text, marked_text, markers), ...]
+        marked_lines = []
+        for j, s in enumerate(batch):
+            original_text = s['text']
+            marked_text, markers = mark_preserved_terms(original_text)
+            batch_markers.append((original_text, marked_text, markers))
+            marked_lines.append(f"{j + 1}. {marked_text}")
+
+        batch_texts = "\n".join(marked_lines)
         preserve_list = ", ".join(PRESERVE_TERMS)
         prompt = f"翻译为教学语气中文，【强制要求】以下专业术语必须原样保留：{preserve_list}\n{batch_texts}"
 
@@ -743,10 +799,13 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
             success_count = sum(1 for t in translations if t and "（翻译失败）" not in t)
             print(f"  📥 批次 {batch_idx} 解析完成: {success_count}/{len(batch)} 条成功")
 
-            # 先记录翻译结果
+            # 先记录翻译结果，并还原保留字
             for j, t in enumerate(translations):
                 if j < len(batch):
-                    sentences[i + j]["cn_text"] = t.strip()
+                    # 还原保留字
+                    _, _, markers = batch_markers[j]
+                    restored = restore_preserved_terms(t.strip(), markers)
+                    sentences[i + j]["cn_text"] = restored
 
             # 单独重试失败的翻译
             failed_indices = []
@@ -755,7 +814,7 @@ def _translate_with_dashscope(sentences: list[dict], config: Config, temp_dir: s
                     failed_indices.append(j)
                     print(f"  ❌ 翻译 [{i + j + 1}/{len(sentences)}] 失败: \"{batch[j]['text']}\"")
 
-            # 批量重试失败的翻译
+            # 批量重试失败的翻译（单条重试不需要标记，因为是单独翻译）
             for j in failed_indices:
                 retry_translation = _retry_single_translation_dashscope(batch[j]['text'], config)
                 if retry_translation:
@@ -791,23 +850,6 @@ def _retry_single_translation_dashscope(text: str, config: Config) -> str:
         import dashscope
         from dashscope import Generation
 
-        # 强制保留字列表
-        PRESERVE_TERMS = [
-            "agent", "Agent", "agents", "Agents",
-            "framework", "Framework",
-            "LLM", "API", "SDK",
-            "endpoint", "endpoints",
-            "webhook", "webhooks",
-            "workflow", "workflows",
-            "GitHub", "NuGet",
-            "Azure", "OpenAI", "Anthropic",
-            "Semantic Kernel",
-            "C#", ".NET", "Python", "JavaScript", "TypeScript",
-            "JSON", "XML", "HTML", "CSS", "REST",
-            "CLI", "GUI", "IDE",
-            "debug", "Debug", "Debugging",
-            "config", "Config", "configuration",
-        ]
         preserve_list = ", ".join(PRESERVE_TERMS)
         prompt = f"翻译为教学语气中文，【强制要求】以下专业术语必须原样保留：{preserve_list}\n{text}"
 
