@@ -1348,14 +1348,35 @@ def process_video(
     temp_dir: str = None
 ):
     """
-    使用 FFmpeg 合并视频和中文音频
-
+    使用 FFmpeg 合并视频和中文音频，生成最终视频文件
+    
     流程：
     1. 提取原视频的音频轨道（作为 BGM 参考）
     2. 如果保留 BGM → 降低音量后与中文音频混合
     3. 用新音频轨道替换原视频的音频
     4. 可选：烧录字幕到视频
+    5. 复制字幕文件到输出目录
+    
+    Args:
+        video_path (str): 原视频文件路径
+        chinese_audio_path (str): 中文配音音频文件路径
+        output_path (str): 输出视频文件路径
+        config (Config): 配置对象，包含以下属性：
+            - keep_original_bgm (bool): 是否保留原视频背景音乐
+            - bgm_volume (float): 背景音乐音量（0.0-1.0）
+            - keep_original_voice (bool): 是否保留原视频语音
+            - burn_subtitles (bool): 是否烧录字幕到视频
+        chinese_srt_path (str, optional): 中文字幕文件路径。默认为 None
+        english_srt_path (str, optional): 英文字幕文件路径。默认为 None
+        temp_dir (str, optional): 临时文件目录路径。默认为 None，使用 config.temp_dir
+    
+    Returns:
+        str: 生成的视频文件路径
+    
+    Raises:
+        RuntimeError: 当 FFmpeg 执行失败时抛出异常，包含错误信息
     """
+
     video_path = Path(video_path)
     chinese_audio_path = Path(chinese_audio_path)
     output_path = Path(output_path)
