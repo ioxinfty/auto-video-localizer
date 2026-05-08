@@ -31,11 +31,15 @@ config = Config(
     enable_checkpoint=True,
     resume_from_checkpoint=False,  # 测试时全部重新生成
     speed_ratio_max=1.0,
+    debug_breakpoint_after_parse=False, # 引发异常，查看翻译的日志
+    debug_log_merge=False,               # 打印字幕合并过程日志
+    debug_breakpoint_after_merge=False,  # 合并后中断
 )
-
 # 测试文件路径
-video_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/DevUI Introduction - AI in C# (Microsoft Agent Framework).1080p.mkv'
-srt_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/DevUI Introduction - AI in C# (Microsoft Agent Framework).1080p.en.vtt'
+# video_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/DevUI Introduction - AI in C# (Microsoft Agent Framework).1080p.mkv'
+# srt_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/DevUI Introduction - AI in C# (Microsoft Agent Framework).1080p.en.vtt'
+video_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/Microsoft Agent Framework Introduction - AI in C#.1080p.mkv'
+srt_path = '/Users/iox/Desktop/msagent/source/aiagent_youtube/AI in C# (Microsoft Agent Framework)/Microsoft Agent Framework vs Semantic Kernel vs Microsoft.Extensions.AI.1080p.en.vtt'
 output_dir = "/Users/iox/Desktop/msagent/output"
 
 if __name__ == "__main__":

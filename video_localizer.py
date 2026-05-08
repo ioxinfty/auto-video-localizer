@@ -239,6 +239,15 @@ class Config:
     enable_checkpoint: bool = True  # 是否启用断点续传
     resume_from_checkpoint: bool = True  # 默认重用中间文件，跳过已完成部分
 
+    # 调试开关：翻译解析后立即中断，用于检查解析结果
+    debug_breakpoint_after_parse: bool = False
+
+    # 调试开关：合并字幕时打印详细合并日志
+    debug_log_merge: bool = False
+
+    # 调试开关：合并完成后立即中断，用于检查合并结果
+    debug_breakpoint_after_merge: bool = False
+
 
 # ============================================================
 # 第一步：读取 SRT 文件
@@ -309,7 +318,7 @@ def load_vtt(vtt_path: str) -> list[dict]:
     content = "\n".join(lines[start_idx:])
 
     blocks = re.split(r"\n\n+", content)
-    for block in blocks:
+    for idx, block in enumerate(blocks):
         lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
         if len(lines) < 2:
             continue
@@ -322,7 +331,7 @@ def load_vtt(vtt_path: str) -> list[dict]:
         text = " ".join(lines[1:]).strip()
         if text:
             segments.append({
-                "index": 0,
+                "index": idx,
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "text": text,
@@ -367,64 +376,200 @@ def save_srt(segments: list[dict], output_path: str):
 
 
 # ============================================================
-# 第二步：拼接碎片句 → 完整句子
+# 第二步：拼接碎片句 → 完整句子（前瞻探测算法）
 # ============================================================
 
-def merge_segments_to_sentences(segments: list[dict]) -> list[dict]:
-    """
-    将 Whisper 的碎片段拼接成完整句子。
+# 强结束符：句子真正结束
+STRONG_ENDINGS = ".!?!。！？'\"')】」》】"
+# 弱结束符：从句/短语边界，可断可不断
+WEAK_ENDINGS = ",;:、，；：—-/\\`"
 
-    判断依据：
-    1. 段尾是否有句末标点（. ! ? 。！？ " ' ）
-    2. 或段尾是否为常见缩写（如 Dr. Mr. e.g.）
-    3. 连续多段但中间有明显停顿（>1秒），也视为分隔
-    4. 优先检查是否为未完成的短语（如介词 to/for/of 结尾）
+
+def _get_ending_type(text: str) -> str:
+    """
+    判断文本结尾的标点类型。
+    返回: 'strong' | 'weak' | 'none'
+    """
+    text = text.strip()
+    if not text:
+        return "none"
+    last_char = text[-1]
+    if last_char in STRONG_ENDINGS:
+        return "strong"
+    if last_char in WEAK_ENDINGS:
+        return "weak"
+    return "none"
+
+
+def _is_abbreviation(text: str) -> bool:
+    """检查是否以常见缩写结尾（不算句末）"""
+    common_abbrevs = (
+        "dr", "mr", "mrs", "ms", "prof", "vs", "etc",
+        "e.g", "i.e", "inc", "llc", "co", "ltd",
+        "a.m", "p.m", "U.S", "U.K", "API", "LLM", "AI",
+        "HTML", "CSS", "JSON", "XML", "SDK"
+    )
+    text = text.strip()
+    if len(text) > 2 and text[-1] == ".":
+        word_before = text.split()[-1].rstrip(".")
+        if word_before.lower() in common_abbrevs:
+            return True
+    return False
+
+
+def merge_segments_to_sentences(segments: list[dict], config: Config = None) -> list[dict]:
+    """
+    将 Whisper/VTT 的碎片段拼接成完整句子。
+    
+    前瞻探测算法：
+    1. 当前片段无结束符 → 向前探测后续片段
+    2. 探测到强结束符(.!?) → 合并到此断句
+    3. 探测到弱结束符(,) → 合并到此断句
+    4. 遇到停顿 > 2秒 → 兜底断句
+    5. 都不满足且到末尾 → 全部合并断句
+    6. 当前片段已有结束符且非缩写 → 直接断句
     """
     sentences = []
-    current = None
-    last_end = 0
+    debug = config and config.debug_log_merge
 
-    for seg in segments:
-        if current is None:
-            current = {
-                "seg_indices": [seg["index"]],
-                "text": seg["text"],
-                "start": seg["start"],
-                "end": seg["end"],
-            }
-        else:
-            current["seg_indices"].append(seg["index"])
-            current["text"] += " " + seg["text"]
-            current["end"] = seg["end"]
+    if not segments:
+        return sentences
 
-        # 判断是否句末
-        text = seg["text"].strip()
+    if debug:
+        print(f"\n{'=' * 60}")
+        print("📝 [DEBUG] 字幕合并过程（前瞻探测）：")
+        print(f"   输入 {len(segments)} 个片段\n")
 
-        # 优先检查是否为未完成的短语（应该继续合并）
-        if _is_incomplete_phrase(text):
-            # 未完成短语，不断开
-            last_end = seg["end"]
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        current_text = seg["text"].strip()
+        current_start = seg["start"]
+        current_end = seg["end"]
+        seg_indices = [seg["index"]]
+
+        # 检查当前片段的结尾类型
+        ending_type = _get_ending_type(current_text)
+        is_abbr = _is_abbreviation(current_text)
+
+        if ending_type == "strong" and not is_abbr:
+            # 当前片段已有强结束符，直接成句
+            if debug:
+                print(f"   ✂️  [seg{seg['index']}] \"{current_text}\" → [强结束符] 单句")
+            sentences.append({
+                "seg_indices": seg_indices,
+                "text": current_text,
+                "start": round(current_start, 3),
+                "end": round(current_end, 3),
+            })
+            i += 1
             continue
 
-        # 检查是否有句末标点
-        is_sentence_end = _is_sentence_ending(text)
+        # ===== 前向探测：找最佳断点 =====
+        j = i + 1
+        best_split_idx = i      # 最佳断点位置（默认当前片段）
+        best_split_type = None  # 断点类型: 'strong' | 'weak' | 'pause'
+        pause_split_idx = -1    # 记录停顿位置（作为兜底）
 
-        # 检查是否有明显停顿（超过 1.5 秒视为分隔）
-        pause_duration = seg["start"] - last_end
-        if pause_duration > 1.5 and len(current["text"].split()) > 5:
-            is_sentence_end = True
+        prev_end = seg["end"]
 
-        last_end = seg["end"]
+        while j < len(segments):
+            next_seg = segments[j]
+            pause = next_seg["start"] - prev_end
 
-        if is_sentence_end:
-            current["text"] = current["text"].strip()
-            sentences.append(current)
-            current = None
+            # 停顿超过 2 秒，记录为可能的兜底断点
+            if pause > 2.0 and pause_split_idx == -1:
+                pause_split_idx = j - 1
 
-    # 兜底：最后一段没有句末标点
-    if current is not None:
-        current["text"] = current["text"].strip()
-        sentences.append(current)
+            next_text = next_seg["text"].strip()
+            next_ending = _get_ending_type(next_text)
+            next_abbr = _is_abbreviation(next_text)
+
+            # 探测到强结束符（排除缩写）→ 最佳断点
+            if next_ending == "strong" and not next_abbr:
+                best_split_idx = j
+                best_split_type = "strong"
+                break
+
+            # 探测到弱结束符 → 检查下一句是否紧接强结束符且合并后不长
+            if next_ending == "weak":
+                # 向前再探一句：如果下一段以强结束符结尾且总长 ≤ 120 字符，跳过此弱断点
+                should_skip_weak = False
+                if j + 1 < len(segments):
+                    lookahead = segments[j + 1]
+                    lookahead_text = lookahead["text"].strip()
+                    lookahead_ending = _get_ending_type(lookahead_text)
+                    lookahead_abbr = _is_abbreviation(lookahead_text)
+                    combined_len = len(current_text) + 1 + len(next_text) + 1 + len(lookahead_text)
+                    if lookahead_ending == "strong" and not lookahead_abbr and combined_len <= 120:
+                        should_skip_weak = True
+
+                if not should_skip_weak:
+                    best_split_idx = j
+                    best_split_type = "weak"
+
+            # 继续探测下一段
+            current_text += " " + next_text
+            current_end = next_seg["end"]
+            seg_indices.append(next_seg["index"])
+            prev_end = next_seg["end"]
+            j += 1
+
+        # 确定最终断点
+        if best_split_type == "strong":
+            # 找到了强结束符，使用它
+            final_idx = best_split_idx
+            reason = f"前探→seg{final_idx}[强结束符]"
+        elif best_split_type == "weak":
+            # 只有弱结束符
+            final_idx = best_split_idx
+            reason = f"前探→seg{final_idx}[弱结束符]"
+        elif pause_split_idx >= 0:
+            # 用停顿兜底
+            final_idx = pause_split_idx
+            reason = f"停顿>2s兜底(seg{final_idx})"
+        else:
+            # 到了最后，全部合并
+            final_idx = len(segments) - 1
+            reason = "到达末尾"
+
+        # 重新构建合并后的文本和时间
+        merged_text = segments[i]["text"].strip()
+        merged_start = segments[i]["start"]
+        merged_end = segments[i]["end"]
+        merged_indices = [segments[i]["index"]]
+
+        for k in range(i + 1, final_idx + 1):
+            merged_text += " " + segments[k]["text"].strip()
+            merged_end = segments[k]["end"]
+            merged_indices.append(segments[k]["index"])
+
+        merged_text = merged_text.strip()
+
+        if debug:
+            print(f"   ✂️  [seg{i}~seg{final_idx}] → [{reason}] 断句:")
+            print(f"       完整句: {merged_text}")
+
+        sentences.append({
+            "seg_indices": merged_indices,
+            "text": merged_text,
+            "start": round(merged_start, 3),
+            "end": round(merged_end, 3),
+        })
+
+        i = final_idx + 1
+
+    if debug:
+        print(f"\n   📊 合并结果: {len(sentences)} 个完整句子")
+        for idx, s in enumerate(sentences):
+            wc = len(s["text"].split())
+            print(f"      [{idx+1}][{wc}词] {s['text']}")
+        print(f"{'=' * 60}\n")
+
+    # 调试断点：合并完成后中断
+    if config and config.debug_breakpoint_after_merge:
+        print("\n🛑 [DEBUG BREAKPOINT] 合并步骤完成，已中断。")
+        raise RuntimeError("debug_breakpoint_after_merge: 停在合并后")
 
     # 分割过长的句子（超过 150 字按逗号分段）
     sentences = split_long_sentences(sentences)
@@ -570,6 +715,13 @@ def _is_sentence_ending(text: str) -> bool:
     if not text:
         return False
 
+    word_count = len(text.split())
+
+    # 短片段（≤3 个词）即使以句末标点结尾也不应单独成句，
+    # 因为 VTT 字幕常将完整句子拆成多个碎片行
+    if word_count <= 3 and text[-1] in (".", "!", "?", "。", "！", "？"):
+        return False
+
     # 常见句末标点
     if text[-1] in (".", "!", "?", "。", "！", "？"):
         return True
@@ -598,9 +750,28 @@ def _is_sentence_ending(text: str) -> bool:
 def translate_sentences(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
     """翻译完整句子"""
     if config.use_local_llm:
-        return _translate_with_ollama(sentences, config, temp_dir)
+        sentences = _translate_with_ollama(sentences, config, temp_dir)
     else:
-        return _translate_with_dashscope(sentences, config, temp_dir)
+        sentences = _translate_with_dashscope(sentences, config, temp_dir)
+
+    # 调试断点：所有翻译完成后中断，用于检查全部结果
+    if config.debug_breakpoint_after_parse:
+        print("\n" + "=" * 60)
+        print("🛑 [DEBUG] 全部翻译完成，触发调试断点")
+        print(f"   共 {len(sentences)} 条翻译：\n")
+        for idx, s in enumerate(sentences):
+            cn = s.get("cn_text", "")
+            en = s.get("text", "?")
+            status = "⚠️" if "（翻译失败）" in cn or "[翻译失败]" in cn else "✅"
+            print(f"   {status} [{idx+1}] {cn}")
+            print(f"       原文: {en}")
+        print("=" * 60)
+        raise RuntimeError(
+            f"[DEBUG] 全部翻译完成断点，共 {len(sentences)} 条。"
+            f"关闭 Config.debug_breakpoint_after_parse 可跳过。"
+        )
+
+    return sentences
 
 
 def _translate_with_ollama(sentences: list[dict], config: Config, temp_dir: str = None) -> list[dict]:
@@ -912,26 +1083,38 @@ def _retry_single_translation_dashscope(text: str, config: Config) -> str:
 
 
 def _parse_translations(raw: str, expected_count: int) -> list[str]:
-    """解析 LLM 返回的多条翻译结果"""
+    """解析 LLM 返回的多条翻译结果
+
+    使用位置切片策略：先找到每个条目的起始位置，再按位置截取，
+    避免翻译文本中的句号/点号被误判为条目分隔符。
+    """
     results = []
     raw = raw.strip()
 
     print(f"  🔍 解析翻译结果 (期望 {expected_count} 条):")
 
-    # 方法1: 匹配 "1. 中文" 或 "1: 中文" 格式
-    matched_lines = []
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^\s*(\d+)[\.\:\、\—\-]\s*(.+)$", line)
-        if m:
-            translation = m.group(2).strip()
-            matched_lines.append((m.group(1), translation))
-            results.append(translation)
-            print(f"    匹配 [{m.group(1)}]: {translation[:50]}...")
+    # 找到所有 "数字. " 或 "数字: " 等格式的起始位置
+    pattern = re.compile(r'(?:^|\n)\s*(\d+)[\.\:\、\—\-]\s*', re.MULTILINE)
 
-    print(f"  📊 解析结果: {len(matched_lines)}/{expected_count} 条")
+    matches = list(pattern.finditer(raw))
+
+    for idx, m in enumerate(matches):
+        start_pos = m.end()  # 跳过编号部分
+        if idx + 1 < len(matches):
+            end_pos = matches[idx + 1].start()
+        else:
+            end_pos = len(raw)
+
+        translation = raw[start_pos:end_pos]
+        translation = translation.strip()
+        translation = re.sub(r'[\n\r]+', ' ', translation).strip()
+        translation = re.sub(r'^[\s]*\d+[\.\:\、\—\-]\s*', '', translation)
+
+        seq_num = m.group(1)
+        results.append(translation)
+        print(f"    匹配 [{seq_num}]: {translation[:60]}...")
+
+    print(f"  📊 解析结果: {len(results)}/{expected_count} 条")
 
     # 确保数量正确，不足时标记失败
     while len(results) < expected_count:
@@ -1010,8 +1193,7 @@ async def synthesize_with_edgetts(sentences: list[dict], config: Config, output_
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, s in enumerate(sentences):
-        seg_idx = s["seg_indices"][0]
-        out_path = output_dir / f"{seg_idx:04d}.wav"
+        out_path = output_dir / f"{idx:04d}.wav"
 
         # 跳过已合成的（仅当 resume_from_checkpoint=True 时）
         if config.resume_from_checkpoint and out_path.exists() and out_path.stat().st_size > 1000:
@@ -1369,7 +1551,7 @@ def main(
 
     # Step 2: 拼接成完整句子
     print("\n🔗 Step 2: 拼接碎片句为完整句子...")
-    sentences = merge_segments_to_sentences(segments)
+    sentences = merge_segments_to_sentences(segments, config)
     print(f"  合并为 {len(sentences)} 个完整句子")
     for i, s in enumerate(sentences[:3]):
         print(f"    句 {i + 1}: {s['text'][:60]}...")

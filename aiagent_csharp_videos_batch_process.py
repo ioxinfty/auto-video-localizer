@@ -38,7 +38,7 @@ def run_batch_process(config: Config, output_dir: str):
     skip_count = 0
     fail_count = 0
 
-    for idx, task in enumerate(task_queue):
+    for idx, task in enumerate(task_queue.values()):
         seq = task["seq"]
         title = task["title"]
         video_path = task["video"]
