@@ -1494,6 +1494,24 @@ def process_video(
     return str(output_path)
 
 
+def check_final_video_exists(final_video: Path, config: Config) -> bool:
+    """
+    检查最终输出视频是否已生成。
+
+    Args:
+        final_video: 最终视频路径
+        config: 配置对象
+
+    Returns:
+        True 表示视频已存在可跳过, False 表示需要处理
+    """
+    return (
+        config.resume_from_checkpoint
+        and final_video.exists()
+        and final_video.stat().st_size > 1000
+    )
+
+
 # ============================================================
 # 主程序入口
 # ============================================================
@@ -1564,6 +1582,12 @@ def main(
     print(f"  临时目录: {temp_dir}")
     print(f"  输出目录: {final_output_dir}")
     print("=" * 60)
+
+    # 预检查：如果最终视频已存在，直接跳过所有步骤
+    final_video = final_output_dir / f"{video_name}.cn.mp4"
+    if check_final_video_exists(final_video, config):
+        print(f"\n⏩ 最终视频已生成，跳过所有步骤: {final_video}")
+        return
 
     # Step 1: 读取字幕文件
     print("\n📖 Step 1: 读取字幕文件...")
@@ -1636,11 +1660,10 @@ def main(
         stitch_audio_segments(sentences, config, str(chinese_audio))
 
     # Step 7: 合并视频（检查实际文件是否存在）
-    final_video = final_output_dir / f"{video_name}.cn.mp4"
     if video_path.exists():
         print("\n🎬 Step 7: 合并视频和音频...")
 
-        if config.resume_from_checkpoint and final_video.exists() and final_video.stat().st_size > 1000:
+        if check_final_video_exists(final_video, config):
             print("  ⏩ 跳过（视频已生成）")
         else:
             # 生成中文字幕文件（用于烧录和复制）
