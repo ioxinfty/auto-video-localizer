@@ -37,19 +37,48 @@ def clean_filename(name: str) -> str:
     return cleaned.strip()
 
 
+def normalize_for_matching(text: str) -> str:
+    """归一化特殊字符用于文件夹名匹配
+
+    video_localizer.py 处理时或文件系统会将部分特殊字符转义：
+      / → ⧸ (fraction slash)
+      : → ： (full-width colon)
+      ? → ？ (full-width question mark)
+    """
+    normalized = text
+    char_map = {
+        '/': '⧸',
+        ':': '：',
+        '?': '？',
+    }
+    for original, escaped in char_map.items():
+        normalized = normalized.replace(original, escaped)
+    return normalized
+
+
 def find_video_folder(title: str) -> Optional[Path]:
-    """根据 title 查找对应的输出文件夹"""
-    # 尝试精确匹配：title + " (Microsoft Agent Framework).1080p"
-    folder_name = f"{title}.1080p"
-    folder_path = OUTPUT_DIR / folder_name
-    if folder_path.exists():
-        return folder_path
-    
-    # 尝试在 output 目录中搜索包含 title 的文件夹
+    """根据 title 查找对应的输出文件夹（支持字符归一化 + 多分辨率回退）"""
+    normalized_title = normalize_for_matching(title)
+
+    # 策略1: 精确匹配 — 原始 title + 分辨率后缀
+    for suffix in ['.1080p', '.720p']:
+        folder_path = OUTPUT_DIR / f"{title}{suffix}"
+        if folder_path.exists():
+            return folder_path
+
+    # 策略2: 归一化精确匹配 — 转义后的 title + 分辨率后缀
+    for suffix in ['.1080p', '.720p']:
+        folder_path = OUTPUT_DIR / f"{normalized_title}{suffix}"
+        if folder_path.exists():
+            return folder_path
+
+    # 策略3: 遍历目录做子串模糊匹配（最后手段）
     for folder in OUTPUT_DIR.iterdir():
-        if folder.is_dir() and title in folder.name:
+        if not folder.is_dir():
+            continue
+        if title in folder.name or normalized_title in folder.name:
             return folder
-    
+
     return None
 
 
