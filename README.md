@@ -13,6 +13,7 @@
 msagent/
 ├── video_localizer.py              # 核心处理模块（7步流水线）
 ├── aiagent_csharp_videos_batch_process.py  # 批量处理入口， 调用 aiagent_csharp_task_queue.py 之类的任务
+├── export_aiagent_csharp.py       # 导出成品到 upload 目录，按 seq 编号重命名
 ├── check_video_list.py             # 解析 video_list.html 生成任务队列， 保存为 task_queue.py 供 aiagent_csharp_videos_batch_process.py 调用
 ├── aiagent_csharp_task_queue.py    # 自动生成的任务队列（119个视频）
 ├── temp_batch_process.py           # 另一个批量处理脚本
@@ -39,7 +40,13 @@ temp/                               # 临时文件（按视频分目录）
     └── audio/                    # TTS 逐句音频
         └── *.wav
 
-output/                            # 最终成品
+upload/                            # 导出目录（按 seq 编号重命名后的成品）
+└── aiagent_c#/
+    ├── 001. {标题}.mp4
+    ├── 001. {标题}.chs.srt
+    └── 001. {标题}.en.srt
+
+output/                            # 最终成品（原始文件夹名）
 └── aiagent_c#/
     └── {视频名}/
         ├── *.cn.mp4              # 中文配音视频
@@ -209,6 +216,23 @@ python test_video_localizer.py
 ```bash
 python check_video_list.py
 ```
+
+### 6. 导出成品到 upload 目录
+
+处理完成后，运行导出脚本将 `output/` 中的成品按 `task_queue` 的 `seq` 编号重命名并复制到 `upload/` 目录：
+
+```bash
+python export_aiagent_csharp.py
+```
+
+**导出规则**：
+- 视频文件 → `{seq:03d}. {标题}.mp4`
+- 中文字幕 → `{seq:03d}. {标题}.chs.srt`
+- 英文字幕 → `{seq:03d}. {标题}.en.srt`
+
+**文件夹匹配**：脚本会自动处理标题中的特殊字符转义（`/` → `⧸`，`:` → `：`，`?` → `？`），并支持 `.1080p` / `.720p` 两种分辨率后缀的自动识别。
+
+**跳过机制**：若目标文件已存在则自动跳过，不会重复复制。
 
 ## 断点续传
 
