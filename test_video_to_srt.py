@@ -62,6 +62,10 @@ class TestVideoToSRT(unittest.TestCase):
         import shutil
         shutil.rmtree(self.temp_dir)
         shutil.rmtree(self.output_dir)
+        # 清理环境变量
+        for key in list(os.environ.keys()):
+            if key.startswith("WHISPER_") or key in ("TEMP_DIR", "OUTPUT_DIR"):
+                del os.environ[key]
 
     def test_init(self):
         """测试初始化"""
@@ -72,6 +76,37 @@ class TestVideoToSRT(unittest.TestCase):
         # 测试目录是否创建
         self.assertTrue(Path(self.temp_dir).exists())
         self.assertTrue(Path(self.output_dir).exists())
+
+    def test_init_with_env_vars(self):
+        """测试通过环境变量初始化"""
+        # 设置环境变量
+        os.environ["WHISPER_SERVICE_URL"] = "http://whisper.example.com:9000/asr"
+        os.environ["TEMP_DIR"] = "/tmp/my_temp"
+        os.environ["OUTPUT_DIR"] = "/tmp/my_output"
+
+        # 创建处理器（不传参，从环境变量读取）
+        processor = VideoToSRT()
+
+        self.assertEqual(processor.whisper_service_url, "http://whisper.example.com:9000/asr")
+        self.assertEqual(str(processor.temp_dir), "/tmp/my_temp")
+        self.assertEqual(str(processor.output_dir), "/tmp/my_output")
+
+    def test_init_with_mixed_config(self):
+        """测试混合配置：参数优先于环境变量"""
+        # 设置环境变量
+        os.environ["WHISPER_SERVICE_URL"] = "http://from-env.example.com:9000/asr"
+        os.environ["TEMP_DIR"] = "/tmp/env_temp"
+
+        # 创建处理器（部分传参，部分从环境变量）
+        processor = VideoToSRT(
+            whisper_service_url="http://from-param.example.com:9000/asr",
+            # temp_dir 不传，从环境变量
+            output_dir="/tmp/param_output"
+        )
+
+        self.assertEqual(processor.whisper_service_url, "http://from-param.example.com:9000/asr")
+        self.assertEqual(str(processor.temp_dir), "/tmp/env_temp")
+        self.assertEqual(str(processor.output_dir), "/tmp/param_output")
 
     def test_seconds_to_srt_time(self):
         """测试秒数转 SRT 时间戳"""
@@ -292,6 +327,85 @@ This is a test
         mock_save.assert_called_once()
         self.assertEqual(result["video_path"], str(video_path))
         self.assertEqual(result["srt_path"], str(expected_srt))
+
+    @patch.object(VideoToSRT, 'process_video')
+    def test_convert(self, mock_process):
+        """测试 convert 方法"""
+        # 准备模拟数据
+        video_path = Path(self.temp_dir) / "test.mp4"
+        with open(video_path, "w") as f:
+            f.write("fake video")
+
+        expected_srt = Path(self.output_dir) / "output.srt"
+        mock_process.return_value = {
+            "video_path": str(video_path),
+            "srt_path": str(expected_srt),
+            "language": "en"
+        }
+
+        # 调用 convert
+        result = self.processor.convert(
+            input_video=str(video_path),
+            output_srt=str(expected_srt),
+            language="en",
+            task="transcribe",
+            keep_audio=False
+        )
+
+        # 验证
+        mock_process.assert_called_once()
+        self.assertEqual(result, str(expected_srt))
+
+    @patch("subprocess.run")
+    def test_extract_audio_skip_if_exists(self, mock_subprocess_run):
+        """测试如果音频已存在则跳过提取"""
+        # 创建假视频文件
+        video_path = Path(self.temp_dir) / "test.mp4"
+        with open(video_path, "w") as f:
+            f.write("fake video")
+
+        # 创建已存在的音频文件
+        output_audio = Path(self.temp_dir) / "test.mp3"
+        with open(output_audio, "w") as f:
+            f.write("fake audio")
+
+        # 调用提取
+        result = self.processor.extract_audio_from_video(
+            str(video_path),
+            str(output_audio)
+        )
+
+        # 验证 FFmpeg 没有被调用（因为文件已存在）
+        mock_subprocess_run.assert_not_called()
+        self.assertEqual(result, str(output_audio))
+
+    @patch("subprocess.run")
+    def test_extract_audio_force_reextract(self, mock_subprocess_run):
+        """测试强制重新提取"""
+        # 模拟 FFmpeg 成功
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_subprocess_run.return_value = mock_result
+
+        # 创建假视频文件
+        video_path = Path(self.temp_dir) / "test.mp4"
+        with open(video_path, "w") as f:
+            f.write("fake video")
+
+        # 创建已存在的音频文件
+        output_audio = Path(self.temp_dir) / "test.mp3"
+        with open(output_audio, "w") as f:
+            f.write("fake audio")
+
+        # 调用提取（强制重新提取）
+        result = self.processor.extract_audio_from_video(
+            str(video_path),
+            str(output_audio),
+            force_reextract=True
+        )
+
+        # 验证 FFmpeg 被调用了
+        mock_subprocess_run.assert_called_once()
 
 
 class TestVideoToSRTIntegration(unittest.TestCase):

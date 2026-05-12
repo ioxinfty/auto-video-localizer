@@ -6,7 +6,15 @@
 3. 生成 SRT 字幕文件
 
 依赖安装：
-pip install requests
+pip install requests python-dotenv
+
+环境变量配置 (.env 文件):
+WHISPER_SERVICE_URL=http://localhost:9000/asr  # Whisper ASR 服务地址
+WHISPER_LANGUAGE=en                              # 默认语言 (可选)
+WHISPER_TASK=transcribe                          # 任务类型: transcribe/translate (可选)
+WHISPER_KEEP_AUDIO=false                         # 是否保留音频文件 (可选)
+TEMP_DIR=temp                                    # 临时文件目录 (可选)
+OUTPUT_DIR=output                                # 输出目录 (可选)
 """
 
 import os
@@ -16,6 +24,13 @@ import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+
+# 加载 .env 环境变量
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # 如果没有 python-dotenv，继续使用环境变量
 
 
 @dataclass
@@ -40,21 +55,43 @@ class VideoToSRT:
 
     def __init__(
         self,
-        whisper_service_url: str = "http://localhost:9000/asr",
-        temp_dir: str = "temp",
-        output_dir: str = "output"
+        whisper_service_url: Optional[str] = None,
+        temp_dir: Optional[str] = None,
+        output_dir: Optional[str] = None
     ):
         """
         初始化视频转字幕工具
 
         Args:
-            whisper_service_url: Whisper ASR Web 服务地址
-            temp_dir: 临时文件目录
-            output_dir: 输出目录
+            whisper_service_url: Whisper ASR Web 服务地址，
+                不传则从环境变量 WHISPER_SERVICE_URL 读取，默认: http://localhost:9000/asr
+            temp_dir: 临时文件目录，
+                不传则从环境变量 TEMP_DIR 读取，默认: temp
+            output_dir: 输出目录，
+                不传则从环境变量 OUTPUT_DIR 读取，默认: output
         """
-        self.whisper_service_url = whisper_service_url
-        self.temp_dir = Path(temp_dir)
-        self.output_dir = Path(output_dir)
+        # 辅助函数：去除值后面的注释
+        def _clean_env_value(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return value
+            # 去除 # 后面的注释，以及首尾空白
+            return value.split("#", 1)[0].strip() or None
+
+        self.whisper_service_url = (
+            whisper_service_url
+            or _clean_env_value(os.getenv("WHISPER_SERVICE_URL"))
+            or "http://localhost:9000/asr"
+        )
+        self.temp_dir = Path(
+            temp_dir
+            or _clean_env_value(os.getenv("TEMP_DIR"))
+            or "temp"
+        )
+        self.output_dir = Path(
+            output_dir
+            or _clean_env_value(os.getenv("OUTPUT_DIR"))
+            or "output"
+        )
 
         # 创建目录
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -64,7 +101,8 @@ class VideoToSRT:
         self,
         video_path: str,
         output_audio_path: Optional[str] = None,
-        bitrate: str = "128k"
+        bitrate: str = "128k",
+        force_reextract: bool = False
     ) -> str:
         """
         从视频中提取音频（MP3）
@@ -73,6 +111,7 @@ class VideoToSRT:
             video_path: 视频文件路径
             output_audio_path: 输出音频文件路径（可选）
             bitrate: MP3 比特率
+            force_reextract: 强制重新提取（即使文件已存在）
 
         Returns:
             输出音频文件路径
@@ -87,6 +126,11 @@ class VideoToSRT:
             output_audio_path = self.temp_dir / f"{video_path.stem}.mp3"
         else:
             output_audio_path = Path(output_audio_path)
+
+        # 检查文件是否已存在
+        if output_audio_path.exists() and not force_reextract:
+            print(f"🎬 音频文件已存在，直接使用: {output_audio_path.name}")
+            return str(output_audio_path)
 
         print(f"🎬 从视频提取音频: {video_path.name}")
 
@@ -141,35 +185,45 @@ class VideoToSRT:
 
         print(f"🎤 调用 Whisper ASR 服务: {self.whisper_service_url}")
 
-        # 准备请求参数
+        # 准备请求参数 - whisper-asr-webservice 格式
         files = {"audio_file": open(str(audio_path), "rb")}
-        data = {
+        params = {
             "task": task,
-            "word_timestamps": str(word_timestamps).lower(),
             "output": "json"
         }
 
         if language:
-            data["language"] = language
+            params["language"] = language
 
         if initial_prompt:
-            data["initial_prompt"] = initial_prompt
+            params["initial_prompt"] = initial_prompt
+
+        print(f"📤 查询参数: {params}")
 
         try:
             response = requests.post(
                 self.whisper_service_url,
                 files=files,
-                data=data,
+                params=params,  # 参数通过 query 传递
                 timeout=3600  # 较长超时，大文件可能需要更久
             )
 
             files["audio_file"].close()
 
             if response.status_code != 200:
+                print(f"⚠️  Whisper 服务返回状态码: {response.status_code}")
+                print(f"⚠️  响应内容: {response.text[:200]}")
                 raise RuntimeError(f"Whisper 服务返回错误 {response.status_code}: {response.text}")
 
+            # 先打印响应内容用于调试
+            print(f"📥 Whisper 服务响应内容（前200字符）: {response.text[:200]}")
+
             # 解析响应
-            result_json = response.json()
+            try:
+                result_json = response.json()
+            except Exception as e:
+                print(f"⚠️  JSON 解析失败，响应内容: {response.text}")
+                raise RuntimeError(f"Whisper 服务返回了无效的 JSON: {response.text[:100]}") from e
 
             # 转换为 WhisperResult 对象
             segments = []
@@ -200,19 +254,29 @@ class VideoToSRT:
     def save_as_srt(
         self,
         result: WhisperResult,
-        output_srt_path: str
+        output_srt_path: str,
+        video_path: Optional[str] = None
     ) -> str:
         """
         将识别结果保存为 SRT 字幕文件
 
         Args:
             result: WhisperResult 对象
-            output_srt_path: 输出 SRT 文件路径
+            output_srt_path: 输出 SRT 文件路径或目录
+            video_path: 原视频路径（如果 output_srt_path 是目录，用来生成文件名）
 
         Returns:
             输出 SRT 文件路径
         """
         output_srt_path = Path(output_srt_path)
+
+        # 如果是目录，自动生成文件名
+        if output_srt_path.is_dir():
+            if video_path:
+                output_srt_path = output_srt_path / f"{Path(video_path).stem}.srt"
+            else:
+                output_srt_path = output_srt_path / "output.srt"
+            print(f"📁 输出是目录，自动生成文件名: {output_srt_path.name}")
 
         # 确保父目录存在
         output_srt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +297,46 @@ class VideoToSRT:
         print(f"✅ SRT 字幕已保存: {output_srt_path.name}")
         return str(output_srt_path)
 
+    def convert(
+        self,
+        input_video: str,
+        output_srt: Optional[str] = None,
+        language: Optional[str] = None,
+        task: str = "transcribe",
+        keep_audio: bool = False,
+        initial_prompt: Optional[str] = None,
+        force_reextract: bool = False
+    ) -> str:
+        """
+        将输入视频文件转换为输出字幕文件（简单直接接口）
+
+        Args:
+            input_video: 输入视频文件路径
+            output_srt: 输出 SRT 字幕文件路径，None 时自动保存到 output_dir
+            language: 语言代码（如 'en', 'zh'），None 为自动检测
+            task: 任务类型 ('transcribe' 转录 或 'translate' 翻译)
+            keep_audio: 是否保留提取的音频文件
+            initial_prompt: 初始提示词
+            force_reextract: 强制重新提取音频（即使已存在）
+
+        Returns:
+            输出 SRT 字幕文件路径
+        """
+        # 如果 output_srt 为 None，自动保存到 output_dir，文件名与视频同名
+        if output_srt is None:
+            output_srt = str(self.output_dir)
+
+        result = self.process_video(
+            video_path=input_video,
+            output_srt_path=output_srt,
+            language=language,
+            task=task,
+            keep_audio=keep_audio,
+            initial_prompt=initial_prompt,
+            force_reextract=force_reextract
+        )
+        return result["srt_path"]
+
     def process_video(
         self,
         video_path: str,
@@ -240,7 +344,8 @@ class VideoToSRT:
         language: Optional[str] = None,
         task: str = "transcribe",
         keep_audio: bool = False,
-        initial_prompt: Optional[str] = None
+        initial_prompt: Optional[str] = None,
+        force_reextract: bool = False
     ) -> Dict[str, str]:
         """
         完整处理流程：视频 -> 音频 -> Whisper识别 -> SRT字幕
@@ -252,6 +357,7 @@ class VideoToSRT:
             task: 任务类型 ('transcribe' 或 'translate')
             keep_audio: 是否保留提取的音频文件
             initial_prompt: 初始提示词
+            force_reextract: 强制重新提取音频（即使已存在）
 
         Returns:
             包含路径信息的字典
@@ -273,7 +379,10 @@ class VideoToSRT:
 
         # Step 1: 提取音频
         print("\n📌 Step 1: 从视频提取音频...")
-        audio_path = self.extract_audio_from_video(str(video_path))
+        audio_path = self.extract_audio_from_video(
+            str(video_path),
+            force_reextract=force_reextract
+        )
 
         # Step 2: Whisper 识别
         print("\n📌 Step 2: Whisper ASR 识别...")
@@ -286,7 +395,7 @@ class VideoToSRT:
 
         # Step 3: 保存 SRT
         print("\n📌 Step 3: 保存 SRT 字幕...")
-        self.save_as_srt(result, str(output_srt_path))
+        self.save_as_srt(result, str(output_srt_path), str(video_path))
 
         # 清理临时音频文件
         if not keep_audio and Path(audio_path).exists():
@@ -395,17 +504,124 @@ class VideoToSRT:
         return segments
 
 
-if __name__ == "__main__":
-    # 使用示例
-    processor = VideoToSRT(
-        whisper_service_url="http://localhost:9000/asr",
-        temp_dir="temp",
-        output_dir="output"
+def main():
+    """命令行接口"""
+    import argparse
+
+    # 辅助函数：去除值后面的注释
+    def _clean_env_value(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        # 去除 # 后面的注释，以及首尾空白
+        return value.split("#", 1)[0].strip() or None
+
+    parser = argparse.ArgumentParser(
+        description="视频转字幕工具 - 使用 Whisper ASR Web 服务"
     )
 
-    # 完整处理视频
-    # processor.process_video(
+    parser.add_argument(
+        "input_video",
+        help="输入视频文件路径"
+    )
+    parser.add_argument(
+        "output_srt",
+        nargs="?",
+        help="输出 SRT 字幕文件路径（可选，默认保存到 output_dir）"
+    )
+    parser.add_argument(
+        "--service", "-s",
+        default=_clean_env_value(os.getenv("WHISPER_SERVICE_URL")) or "http://localhost:9000/asr",
+        help="Whisper ASR Web 服务地址 (默认: 来自环境变量 WHISPER_SERVICE_URL 或 http://localhost:9000/asr)"
+    )
+    parser.add_argument(
+        "--language", "-l",
+        default=_clean_env_value(os.getenv("WHISPER_LANGUAGE")),
+        help="语言代码 (如 'en', 'zh'), 不指定则自动检测 (可通过环境变量 WHISPER_LANGUAGE 设置)"
+    )
+    parser.add_argument(
+        "--task", "-t",
+        default=_clean_env_value(os.getenv("WHISPER_TASK")) or "transcribe",
+        choices=["transcribe", "translate"],
+        help="任务类型: transcribe(转录) 或 translate(翻译) (可通过环境变量 WHISPER_TASK 设置)"
+    )
+    parser.add_argument(
+        "--keep-audio", "-k",
+        action="store_true",
+        help="保留提取的音频文件 (可通过环境变量 WHISPER_KEEP_AUDIO=true 设置)"
+    )
+    parser.add_argument(
+        "--force-reextract", "-f",
+        action="store_true",
+        help="强制重新提取音频（即使文件已存在）"
+    )
+    parser.add_argument(
+        "--temp-dir",
+        default=_clean_env_value(os.getenv("TEMP_DIR")) or "temp",
+        help="临时文件目录 (默认: 来自环境变量 TEMP_DIR 或 temp)"
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=_clean_env_value(os.getenv("OUTPUT_DIR")) or "output",
+        help="默认输出目录 (默认: 来自环境变量 OUTPUT_DIR 或 output)"
+    )
+
+    args = parser.parse_args()
+
+    # 创建处理器
+    processor = VideoToSRT(
+        whisper_service_url=args.service,
+        temp_dir=args.temp_dir,
+        output_dir=args.output_dir
+    )
+
+    # 处理视频
+    try:
+        # 处理 keep_audio：参数优先，然后环境变量
+        keep_audio = args.keep_audio
+        if not keep_audio:
+            env_val = _clean_env_value(os.getenv("WHISPER_KEEP_AUDIO"))
+            keep_audio = env_val and env_val.lower() in ("true", "1", "yes")
+
+        srt_path = processor.convert(
+            input_video=args.input_video,
+            output_srt=args.output_srt,
+            language=args.language,
+            task=args.task,
+            keep_audio=keep_audio,
+            force_reextract=args.force_reextract
+        )
+        print(f"\n✅ 成功！字幕文件: {srt_path}")
+        return 0
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    # 使用示例
+    # 方式0: 使用 .env 配置 (无需传参)
+    processor = VideoToSRT()  # 参数从 .env 文件读取，没有则用默认值
+
+    # 方式1: 简单直接 - 指定输入视频和输出字幕文件
+    processor.convert(
+        input_video='/Users/iox/Desktop/msagent/source/全网最全！60分钟全面掌握Claude Code～【附完整文档】.mp4',
+        output_srt='',
+        language=None  # 可选：指定语言，None 自动检测
+    )
+
+    # 方式2: 完整处理 - 更多参数控制
+    # result = processor.process_video(
     #     video_path="/path/to/video.mp4",
+    #     output_srt_path="/path/to/output.srt",
     #     language="en",
-    #     keep_audio=False
+    #     task="transcribe",  # 或 "translate"
+    #     keep_audio=False,
+    #     initial_prompt=None
     # )
+    # print(f"SRT 已生成: {result['srt_path']}")
+
+    # 方式3: 命令行调用（见 main 函数）
+    # 执行: python video_to_srt.py video.mp4 output.srt -l en
+    # import sys
+    # if len(sys.argv) > 1 and not sys.argv[0].endswith("unittest"):
+    #     sys.exit(main())
