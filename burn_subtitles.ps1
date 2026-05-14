@@ -136,9 +136,13 @@ foreach ($video in $videoFiles) {
             "-loglevel", "error",
             "-i", $tmpVideo,
             "-vf", $vfArg,
-            "-c:v", "mpeg4",
-            "-q:v", "3",
-            "-c:a", "copy",
+            # "-c:v", "mpeg4",
+            # "-q:v", "3",
+            # "-c:a", "copy",
+            "-c:v", "libx264",    # 使用现代的 H.264 编码器
+            "-preset", "veryfast", # 编码速度，想要体积更小可以改为 medium
+            "-crf", "23",         # 关键：质量控制，范围 0-51。23 是默认值，18-28 之间画质极好且体积适中
+            "-c:a", "copy",       # 音频流保持不变
             $tmpOutput
         )
         
