@@ -194,6 +194,8 @@ class VideoToSRT:
 
         if language:
             params["language"] = language
+        else:
+            print(f"🔍 未指定语言，将由 Whisper 服务自动检测")
 
         if initial_prompt:
             params["initial_prompt"] = initial_prompt
@@ -322,10 +324,6 @@ class VideoToSRT:
         Returns:
             输出 SRT 字幕文件路径
         """
-        # 如果 output_srt 为 None，自动保存到 output_dir，文件名与视频同名
-        if output_srt is None:
-            output_srt = str(self.output_dir)
-
         result = self.process_video(
             video_path=input_video,
             output_srt_path=output_srt,
@@ -372,7 +370,7 @@ class VideoToSRT:
         print("=" * 60)
 
         # 确定输出路径
-        if output_srt_path is None:
+        if not output_srt_path:
             output_srt_path = self.output_dir / f"{video_path.stem}.srt"
 
         output_srt_path = Path(output_srt_path)
@@ -606,9 +604,9 @@ if __name__ == "__main__":
     processor.convert(
         input_video='/Users/iox/Desktop/msagent/source/全网最全！60分钟全面掌握Claude Code～【附完整文档】.mp4',
         output_srt='',
-        language=None  # 可选：指定语言，None 自动检测
+        language='zh',  # 可选：指定语言，None 自动检测
+        initial_prompt='这是一段 claudes code 的使用教学视频， 使用中文普通话录制。claudes code 是一个基于 ai 的开发平台，里面可能会出现很多基于开发相关的术语， 比如 skills plugin， skill， plugin， 插件, memory, 如果有读音类似，或是出现语句不通顺的地方时，请考虑选择正确的读音内容。'
     )
-
     # 方式2: 完整处理 - 更多参数控制
     # result = processor.process_video(
     #     video_path="/path/to/video.mp4",
